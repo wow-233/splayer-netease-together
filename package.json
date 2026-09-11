@@ -1,0 +1,20 @@
+{
+  "name": "splayer-netease-together",
+  "version": "1.0.0",
+  "description": "SPlayer-Next 网易云一起听插件（加入真实房间 + 同步播放 + 队列）",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "smoke": "node scripts/build.mjs && node scripts/smoke.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test \"src/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "esbuild": "^0.28.2",
+    "tsup": "^8.3.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
