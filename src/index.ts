@@ -82,6 +82,7 @@ let joining = false;
 
 /** 菜单项 id 常量 */
 const MENU = {
+  create: "together-create",
   join: "together-join",
   leave: "together-leave",
   push: "together-push",
@@ -121,6 +122,7 @@ ctx.register({
     },
   ],
   menus: [
+    { id: MENU.create, label: "创建一起听房间（复制链接）" },
     { id: MENU.join, label: "加入一起听" },
     { id: MENU.leave, label: "退出一起听" },
     { id: MENU.push, label: "推歌到一起听" },
@@ -169,6 +171,20 @@ ctx.onSettingChange(SETTING_ROOM_LINK, (value) => {
 
 ctx.on("menuClick", async ({ menuId, track }) => {
   switch (menuId) {
+    case MENU.create: {
+      if (engine.inRoom) return { toast: "已在房间中，请先退出一起听" };
+      try {
+        const { roomId, creatorId } = await engine.create();
+        const link =
+          "https://st.music.163.com/listen-together/share/?roomId=" +
+          encodeURIComponent(roomId) +
+          "&inviterId=" +
+          encodeURIComponent(creatorId);
+        return { toast: "已创建一起听房间，分享链接已复制", copyText: link };
+      } catch (err) {
+        return { toast: err instanceof Error ? err.message : String(err) };
+      }
+    }
     case MENU.join: {
       if (engine.inRoom) return { toast: "已在一起听房间中" };
       if (joining) return { toast: "正在加入…" };

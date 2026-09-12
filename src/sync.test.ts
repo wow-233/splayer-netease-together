@@ -98,6 +98,16 @@ test("parseRoomLink：非法/空输入返回空对象", () => {
   assert.deepEqual(parseRoomLink("not-a-link"), {});
 });
 
+test("parseRoomLink：兼容 multishare 链接的 inviterUid", () => {
+  const parsed = parseRoomLink(
+    "https://st.music.163.com/listen-together/multishare/index.html?roomId=261457dc16edd2d823ce56e6965d7f70_1789174659929&inviterUid=17932835450",
+  );
+  assert.deepEqual(parsed, {
+    roomId: "261457dc16edd2d823ce56e6965d7f70_1789174659929",
+    inviterId: "17932835450",
+  });
+});
+
 test("displaySongIds：兼容对象与原始值两种展示项", () => {
   const ids = displaySongIds({
     playlist: { displayList: { result: [{ songId: 1 }, 2, { songId: "3" }] } },

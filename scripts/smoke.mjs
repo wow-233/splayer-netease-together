@@ -130,7 +130,7 @@ assert.deepEqual(
   "应订阅播放事件",
 );
 assert.equal(reg.controls, true, "应声明反向控制");
-assert.equal(reg.menus.length, 5, "应有 5 个菜单项");
+assert.equal(reg.menus.length, 6, "应有 6 个菜单项");
 assert.equal(reg.settings.length, 3, "应有 3 个设置项");
 assert.ok(
   reg.menus.some((m) => m.id === "together-push"),
@@ -152,7 +152,7 @@ settings.roomLink =
 const joinRes2 = await menuClick({ menuId: "together-join", track: null });
 const acceptCall = neteaseCalls.find((c) => c.name === "listentogether_accept");
 assert.ok(acceptCall, "应调用 listentogether_accept");
-assert.equal(acceptCall.params.refer, "inbox_invite");
+assert.equal(acceptCall.params.refer, "third_party_invite");
 assert.equal(acceptCall.params.roomId, "999");
 assert.equal(acceptCall.params.inviterId, "888");
 assert.equal(joinRes2.toast, "已加入一起听");

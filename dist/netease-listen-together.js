@@ -23,7 +23,8 @@
     roomCheck: "listentogether_room_check",
     end: "listentogether_end",
     songDetail: "song_detail",
-    search: "search"
+    search: "search",
+    raw: "netease_raw"
   };
   var NeteaseApiError = class extends Error {
     code;
@@ -59,8 +60,14 @@
       const code = body?.code;
       if (res.status !== 200 || code !== void 0 && Number(code) !== 200) {
         const msg = body?.message ?? body?.msg ?? "";
+        let detail = "";
+        try {
+          detail = JSON.stringify(body).slice(0, 400);
+        } catch {
+          detail = String(body).slice(0, 400);
+        }
         throw new NeteaseApiError(
-          msg ? `netease ${code ?? res.status}: ${msg}` : `netease ${code ?? res.status}`,
+          `${msg ? `netease ${code ?? res.status}: ${msg}` : `netease ${code ?? res.status}`} | body=${detail}`,
           String(code ?? res.status),
           res.status
         );
@@ -68,9 +75,17 @@
       return res.body;
     };
     return {
-      /** 接受邀请加入房间（访客侧） */
-      async accept(roomId, inviterId) {
-        await call(NET.accept, { refer: "inbox_invite", roomId, inviterId });
+      /** 接受邀请加入房间（访客侧）；refer 兼容 inbox_invite 与 multishare 的 third_party_invite */
+      async accept(roomId, inviterId, refer = "third_party_invite") {
+        await call(NET.accept, { refer, roomId, inviterId });
+      },
+      /** 多房间落地页信息（诊断用，判断房间是否有效/可加入） */
+      async multiLandingInfo(roomId) {
+        return call(NET.raw, {
+          uri: "/api/listen/together/multi/landing/info/get",
+          data: { roomId },
+          crypto: "eapi"
+        });
       },
       /** 查询当前一起听状态（是否已在房间） */
       async status() {
@@ -199,7 +214,7 @@
     const text = String(input ?? "").trim();
     if (!text) return {};
     const match = text.match(/[?&]roomId=([^&]+)/i);
-    const inviter = text.match(/[?&]inviterId=([^&]+)/i);
+    const inviter = text.match(/[?&](?:inviterUid|inviterId|uid)=([^&]+)/i);
     const song = text.match(/[?&]songId=([^&]+)/i);
     const pick = (m) => m ? decodeURIComponent(m[1] ?? "") : void 0;
     const out = {};
@@ -255,7 +270,7 @@
       const roomId = parsed.roomId ?? roomLinkOrRoomId.trim();
       const inviterId = inviterIdArg ?? parsed.inviterId;
       if (!roomId || !inviterId) throw new Error("\u623F\u95F4\u94FE\u63A5\u7F3A\u5C11 roomId \u6216 inviterId");
-      await this.api.accept(roomId, inviterId);
+      await this.acceptWithFallback(roomId, inviterId);
       this.roomId = roomId;
       this.inviterId = inviterId;
       this.selfUserId = await this.resolveSelfUserId();
@@ -267,6 +282,46 @@
       this.schedulePoll();
       this.scheduleHeartbeat();
       this.scheduleSample();
+    }
+    /** 依次尝试多种 refer 接受邀请（multishare 用 third_party_invite，收件箱邀请用 inbox_invite） */
+    async acceptWithFallback(roomId, inviterId) {
+      const refers = ["third_party_invite", "inbox_invite"];
+      let lastErr;
+      for (const refer of refers) {
+        try {
+          await this.api.accept(roomId, inviterId, refer);
+          this.ctx.log.info(`[\u4E00\u8D77\u542C] accept \u6210\u529F\uFF08refer=${refer}\uFF09`);
+          return;
+        } catch (err) {
+          lastErr = err;
+          this.ctx.log.warn(
+            `[\u4E00\u8D77\u542C] accept \u5931\u8D25\uFF08refer=${refer}\uFF09\uFF1A`,
+            err instanceof Error ? err.message : err
+          );
+        }
+      }
+      throw new Error(
+        "\u52A0\u5165\u5931\u8D25\uFF1A\u623F\u95F4\u53EF\u80FD\u5DF2\u5931\u6548\u6216\u94FE\u63A5\u8FC7\u671F\uFF08\u4E00\u8D77\u542C\u623F\u95F4\u6709\u6548\u671F\u7EA6 30 \u5206\u949F\uFF09\u3002\u8BF7\u8BA9\u597D\u53CB\u91CD\u65B0\u53D1\u8D77\uFF0C\u6216\u7528\u300C\u521B\u5EFA\u4E00\u8D77\u542C\u623F\u95F4\u300D\u7531\u672C\u673A\u5EFA\u623F\u3002"
+      );
+    }
+    /** 由本机创建一起听房间（HTTP 可用），返回房间信息以便分享 */
+    async create() {
+      const info = await this.api.roomCreate();
+      if (!info.roomId || !info.creatorId) throw new Error("\u521B\u5EFA\u623F\u95F4\u5931\u8D25\uFF1A\u672A\u8FD4\u56DE roomId/creatorId");
+      this.roomId = String(info.roomId);
+      this.inviterId = String(info.creatorId);
+      this.selfUserId = String(info.creatorId);
+      this.running = true;
+      this.backoff = 1;
+      this.lastAppliedSeq = -1;
+      this.lastApplied = null;
+      this.currentSongId = null;
+      await this.reconcile(true);
+      this.schedulePoll();
+      this.scheduleHeartbeat();
+      this.scheduleSample();
+      this.ctx.log.info(`[\u4E00\u8D77\u542C] \u5DF2\u521B\u5EFA\u623F\u95F4 ${this.roomId}`);
+      return { roomId: this.roomId, creatorId: this.inviterId };
     }
     /** 离开房间并停止所有计时器 */
     async leave() {
@@ -598,6 +653,7 @@
   var engine = new TogetherSyncEngine({ ctx });
   var joining = false;
   var MENU = {
+    create: "together-create",
     join: "together-join",
     leave: "together-leave",
     push: "together-push",
@@ -633,6 +689,7 @@
       }
     ],
     menus: [
+      { id: MENU.create, label: "\u521B\u5EFA\u4E00\u8D77\u542C\u623F\u95F4\uFF08\u590D\u5236\u94FE\u63A5\uFF09" },
       { id: MENU.join, label: "\u52A0\u5165\u4E00\u8D77\u542C" },
       { id: MENU.leave, label: "\u9000\u51FA\u4E00\u8D77\u542C" },
       { id: MENU.push, label: "\u63A8\u6B4C\u5230\u4E00\u8D77\u542C" },
@@ -667,6 +724,16 @@
   });
   ctx.on("menuClick", async ({ menuId, track }) => {
     switch (menuId) {
+      case MENU.create: {
+        if (engine.inRoom) return { toast: "\u5DF2\u5728\u623F\u95F4\u4E2D\uFF0C\u8BF7\u5148\u9000\u51FA\u4E00\u8D77\u542C" };
+        try {
+          const { roomId, creatorId } = await engine.create();
+          const link = "https://st.music.163.com/listen-together/share/?roomId=" + encodeURIComponent(roomId) + "&inviterId=" + encodeURIComponent(creatorId);
+          return { toast: "\u5DF2\u521B\u5EFA\u4E00\u8D77\u542C\u623F\u95F4\uFF0C\u5206\u4EAB\u94FE\u63A5\u5DF2\u590D\u5236", copyText: link };
+        } catch (err) {
+          return { toast: err instanceof Error ? err.message : String(err) };
+        }
+      }
       case MENU.join: {
         if (engine.inRoom) return { toast: "\u5DF2\u5728\u4E00\u8D77\u542C\u623F\u95F4\u4E2D" };
         if (joining) return { toast: "\u6B63\u5728\u52A0\u5165\u2026" };

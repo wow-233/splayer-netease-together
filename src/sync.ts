@@ -114,12 +114,12 @@ export const nextPollDelay = (args: {
   return Math.round(capped * args.jitter);
 };
 
-/** 从分享链接解析 roomId / inviterId / songId */
+/** 从分享链接解析 roomId / inviterId / songId（兼容 inviterId 与 multishare 的 inviterUid） */
 export const parseRoomLink = (input: string): { roomId?: string; inviterId?: string; songId?: string } => {
   const text = String(input ?? "").trim();
   if (!text) return {};
   const match = text.match(/[?&]roomId=([^&]+)/i);
-  const inviter = text.match(/[?&]inviterId=([^&]+)/i);
+  const inviter = text.match(/[?&](?:inviterUid|inviterId|uid)=([^&]+)/i);
   const song = text.match(/[?&]songId=([^&]+)/i);
   const pick = (m: RegExpMatchArray | null): string | undefined =>
     m ? decodeURIComponent(m[1] ?? "") : undefined;
@@ -213,7 +213,7 @@ export class TogetherSyncEngine {
     const inviterId = inviterIdArg ?? parsed.inviterId;
     if (!roomId || !inviterId) throw new Error("房间链接缺少 roomId 或 inviterId");
 
-    await this.api.accept(roomId, inviterId);
+    await this.acceptWithFallback(roomId, inviterId);
     this.roomId = roomId;
     this.inviterId = inviterId;
     this.selfUserId = await this.resolveSelfUserId();
@@ -225,6 +225,50 @@ export class TogetherSyncEngine {
     this.schedulePoll();
     this.scheduleHeartbeat();
     this.scheduleSample();
+  }
+
+  /** 依次尝试多种 refer 接受邀请（multishare 用 third_party_invite，收件箱邀请用 inbox_invite） */
+  private async acceptWithFallback(roomId: string, inviterId: string): Promise<void> {
+    const refers = ["third_party_invite", "inbox_invite"];
+    let lastErr: unknown;
+    for (const refer of refers) {
+      try {
+        await this.api.accept(roomId, inviterId, refer);
+        this.ctx.log.info(`[一起听] accept 成功（refer=${refer}）`);
+        return;
+      } catch (err) {
+        lastErr = err;
+        this.ctx.log.warn(
+          `[一起听] accept 失败（refer=${refer}）：`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+    // 接受失败多半是房间已失效/过期（一起听房间有效期约 30 分钟）
+    throw new Error(
+      "加入失败：房间可能已失效或链接过期（一起听房间有效期约 30 分钟）。" +
+        "请让好友重新发起，或用「创建一起听房间」由本机建房。",
+    );
+  }
+
+  /** 由本机创建一起听房间（HTTP 可用），返回房间信息以便分享 */
+  async create(): Promise<{ roomId: string; creatorId: string }> {
+    const info = await this.api.roomCreate();
+    if (!info.roomId || !info.creatorId) throw new Error("创建房间失败：未返回 roomId/creatorId");
+    this.roomId = String(info.roomId);
+    this.inviterId = String(info.creatorId);
+    this.selfUserId = String(info.creatorId);
+    this.running = true;
+    this.backoff = 1;
+    this.lastAppliedSeq = -1;
+    this.lastApplied = null;
+    this.currentSongId = null;
+    await this.reconcile(true);
+    this.schedulePoll();
+    this.scheduleHeartbeat();
+    this.scheduleSample();
+    this.ctx.log.info(`[一起听] 已创建房间 ${this.roomId}`);
+    return { roomId: this.roomId, creatorId: this.inviterId };
   }
 
   /** 离开房间并停止所有计时器 */

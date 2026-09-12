@@ -32,6 +32,7 @@ export const NET = {
   end: "listentogether_end",
   songDetail: "song_detail",
   search: "search",
+  raw: "netease_raw",
 } as const;
 
 /** 接口错误：保留宿主返回的 code 与 status，供退避策略判定风控 */
@@ -74,8 +75,14 @@ export const createNeteaseApi = (ctx: SplayerContext) => {
     const code = (body as { code?: number | string })?.code;
     if (res.status !== 200 || (code !== undefined && Number(code) !== 200)) {
       const msg = (body as { message?: string; msg?: string })?.message ?? (body as { msg?: string })?.msg ?? "";
+      let detail = "";
+      try {
+        detail = JSON.stringify(body).slice(0, 400);
+      } catch {
+        detail = String(body).slice(0, 400);
+      }
       throw new NeteaseApiError(
-        msg ? `netease ${code ?? res.status}: ${msg}` : `netease ${code ?? res.status}`,
+        `${msg ? `netease ${code ?? res.status}: ${msg}` : `netease ${code ?? res.status}`} | body=${detail}`,
         String(code ?? res.status),
         res.status,
       );
@@ -84,9 +91,18 @@ export const createNeteaseApi = (ctx: SplayerContext) => {
   };
 
   return {
-    /** 接受邀请加入房间（访客侧） */
-    async accept(roomId: string, inviterId: string): Promise<void> {
-      await call(NET.accept, { refer: "inbox_invite", roomId, inviterId });
+    /** 接受邀请加入房间（访客侧）；refer 兼容 inbox_invite 与 multishare 的 third_party_invite */
+    async accept(roomId: string, inviterId: string, refer = "third_party_invite"): Promise<void> {
+      await call(NET.accept, { refer, roomId, inviterId });
+    },
+
+    /** 多房间落地页信息（诊断用，判断房间是否有效/可加入） */
+    async multiLandingInfo(roomId: string): Promise<unknown> {
+      return call(NET.raw, {
+        uri: "/api/listen/together/multi/landing/info/get",
+        data: { roomId },
+        crypto: "eapi",
+      });
     },
 
     /** 查询当前一起听状态（是否已在房间） */
