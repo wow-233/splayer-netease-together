@@ -11,8 +11,7 @@
  * 本文件只负责「把两者和宿主粘起来」。
  */
 
-import { TogetherSyncEngine } from "./sync";
-import { parseRoomLink } from "./sync";
+import { buildMultiShareLink, parseRoomLink, TogetherSyncEngine } from "./sync";
 import type { PlaybackEventData, SplayerContext, TogetherTrack } from "./types";
 
 /* ================= 宿主沙箱全局 ================= */
@@ -39,7 +38,10 @@ interface SandboxSplayer {
     on(kind: string, handler: (data: unknown) => void): void;
   };
   netease: {
-    call<T = unknown>(name: string, params?: Record<string, unknown>): Promise<{ status: number; body: T }>;
+    call<T = unknown>(
+      name: string,
+      params?: Record<string, unknown>,
+    ): Promise<{ status: number; body: T }>;
   };
 }
 
@@ -60,10 +62,12 @@ const createSplayerContext = (host: SandboxSplayer): SplayerContext => ({
     setVolume: (v) => host.player.setVolume(v),
     getPosition: () => host.player.getPosition(),
     playTrack: (track) => host.player.playTrack(track),
-    on: (kind, handler) => host.player.on(kind, handler as (data: unknown) => void),
+    on: (kind, handler) =>
+      host.player.on(kind, handler as (data: unknown) => void),
   },
   register: (args) => host.register(args),
-  on: (action, handler) => host.on(action, handler as (req: unknown) => Promise<unknown>),
+  on: (action, handler) =>
+    host.on(action, handler as (req: unknown) => Promise<unknown>),
   getSetting: (key) => host.getSetting(key),
   onSettingChange: (key, handler) => host.onSettingChange(key, handler),
   log: host.log,
@@ -83,15 +87,20 @@ let joining = false;
 /** 菜单项 id 常量 */
 const MENU = {
   create: "together-create",
+  resume: "together-resume",
   join: "together-join",
   leave: "together-leave",
   push: "together-push",
   pin: "together-pin",
   goto: "together-goto",
+  next: "together-next",
+  ended: "together-ended",
 } as const;
 
 /** 判断曲目是否为可推入一起听的网易云在线曲目 */
-const isNeteaseTrack = (track: TogetherTrack | null | undefined): boolean =>
+const isNeteaseTrack = (
+  track: TogetherTrack | null | undefined,
+): track is TogetherTrack =>
   !!track && track.source === "netease" && !!track.id;
 
 ctx.register({
@@ -101,16 +110,17 @@ ctx.register({
     {
       key: SETTING_ROOM_LINK,
       type: "text",
-      label: "一起听房间链接",
-      description: "粘贴网易云一起听分享链接（含 roomId 与 inviterId），或直接填 roomId",
+      label: "多人一起听房间链接",
+      description: "粘贴网易云官方多人一起听链接（地址中包含 multishare）",
       default: "",
-      placeholder: "https://st.music.163.com/listen-together/share/?songId=..&roomId=..&inviterId=..",
+      placeholder:
+        "https://st.music.163.com/listen-together/multishare/index.html?roomId=..&inviterUid=..",
     },
     {
       key: SETTING_AUTO_JOIN,
       type: "switch",
       label: "启动后自动加入",
-      description: "插件启用时，若已配置房间链接则自动加入",
+      description: "插件启用时，若已配置多人房间链接则自动加入",
       default: false,
     },
     {
@@ -122,28 +132,37 @@ ctx.register({
     },
   ],
   menus: [
-    { id: MENU.create, label: "创建一起听房间（复制链接）" },
-    { id: MENU.join, label: "加入一起听" },
-    { id: MENU.leave, label: "退出一起听" },
-    { id: MENU.push, label: "推歌到一起听" },
-    { id: MENU.pin, label: "置顶到一起听" },
-    { id: MENU.goto, label: "立即播放（一起听）" },
+    { id: MENU.push, label: "推歌到多人房间" },
+    { id: MENU.pin, label: "在多人房间置顶" },
+    { id: MENU.goto, label: "让多人房间播放" },
   ],
 });
 
 /** 读取配置并加入房间 */
 const joinFromSetting = async (): Promise<string> => {
   const link = String(ctx.getSetting(SETTING_ROOM_LINK) ?? "").trim();
-  if (!link) throw new Error("请先在插件设置里填写一起听房间链接");
+  if (!link) throw new Error("请先在插件设置里填写多人一起听链接");
   await engine.join(link);
-  return engine.inRoom ? "已加入一起听" : "加入失败";
+  return engine.inRoom ? "已加入多人一起听" : "加入失败";
 };
 
 /* ---------- 播放事件转发 ---------- */
 
+let localTrackId: string | null = null;
+
 ctx.player.on("playStateChange", (data) => {
   const payload = data as PlaybackEventData["playStateChange"];
-  engine.onLocalEvent("playStateChange", { state: payload.state, position: payload.position });
+  if (payload.state === "playing" && localTrackId) {
+    const pending = engine.consumePendingPlayback(localTrackId);
+    if (pending) {
+      if (pending.position > 0) ctx.player.seek(Math.round(pending.position));
+      if (!pending.playing) ctx.player.pause();
+    }
+  }
+  engine.onLocalEvent("playStateChange", {
+    state: payload.state,
+    position: payload.position,
+  });
 });
 
 ctx.player.on("lineChange", (data) => {
@@ -151,12 +170,11 @@ ctx.player.on("lineChange", (data) => {
   engine.onLocalEvent("lineChange", { position: payload.position });
 });
 
-// 曲目就绪后落地云端定位（避免从 0 开始播放）
 ctx.player.on("trackChange", (data) => {
   const payload = data as PlaybackEventData["trackChange"];
-  if (!payload.track) return;
-  const position = engine.consumePendingSeek(String(payload.track.id));
-  if (position !== null && position > 0) ctx.player.seek(Math.max(0, Math.round(position)));
+  localTrackId = payload.track ? String(payload.track.id) : null;
+  if (isNeteaseTrack(payload.track))
+    void engine.onLocalTrackChange(localTrackId!);
 });
 
 /* ---------- 设置变更 ---------- */
@@ -169,70 +187,105 @@ ctx.onSettingChange(SETTING_ROOM_LINK, (value) => {
 
 /* ---------- 菜单点击 ---------- */
 
-ctx.on("menuClick", async ({ menuId, track }) => {
+ctx.on("menuClick", async ({ menuId, track, data }) => {
   switch (menuId) {
+    case "together-status":
+      return { data: await engine.detailedSnapshot() };
     case MENU.create: {
-      if (engine.inRoom) return { toast: "已在房间中，请先退出一起听" };
+      if (engine.inRoom) return { error: "已在房间中，请先退出一起听" };
       try {
-        const { roomId, creatorId } = await engine.create();
-        const link =
-          "https://st.music.163.com/listen-together/share/?roomId=" +
-          encodeURIComponent(roomId) +
-          "&inviterId=" +
-          encodeURIComponent(creatorId);
-        return { toast: "已创建一起听房间，分享链接已复制", copyText: link };
+        const initialTrack = isNeteaseTrack(track) ? track : undefined;
+        const { roomId, creatorId, resumed } = await engine.create(initialTrack);
+        const link = buildMultiShareLink(
+          roomId,
+          creatorId,
+          initialTrack ? String(initialTrack.id) : undefined,
+        );
+        return {
+          toast: resumed ? "已恢复现有多人房间，邀请链接已复制" : "已创建多人一起听房间，邀请链接已复制",
+          copyText: link,
+          data: engine.snapshot,
+        };
       } catch (err) {
-        return { toast: err instanceof Error ? err.message : String(err) };
+        return { error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+    case MENU.resume: {
+      try {
+        const found = await engine.resume();
+        if (!found) return { error: "当前网易云账号没有正在进行的多人房间" };
+        return { toast: "已恢复现有多人房间", data: engine.snapshot };
+      } catch (err) {
+        return { error: err instanceof Error ? err.message : String(err) };
       }
     }
     case MENU.join: {
-      if (engine.inRoom) return { toast: "已在一起听房间中" };
-      if (joining) return { toast: "正在加入…" };
+      if (engine.inRoom) return { error: "已在一起听房间中" };
+      if (joining) return { error: "正在加入…" };
       joining = true;
       try {
-        const message = await joinFromSetting();
-        return { toast: message };
+        const directLink =
+          typeof data === "object" && data !== null && "roomLink" in data
+            ? String((data as { roomLink?: unknown }).roomLink ?? "").trim()
+            : "";
+        if (directLink) await engine.join(directLink);
+        else await joinFromSetting();
+        return { toast: "已加入多人一起听", data: engine.snapshot };
       } catch (err) {
-        return { toast: err instanceof Error ? err.message : String(err) };
+        return { error: err instanceof Error ? err.message : String(err) };
       } finally {
         joining = false;
       }
     }
     case MENU.leave: {
-      if (!engine.inRoom) return { toast: "当前未在房间中" };
+      if (!engine.inRoom) return { error: "当前未在房间中" };
       await engine.leave();
-      return { toast: "已退出一听" };
+      return { toast: "已退出多人一起听", data: engine.snapshot };
     }
     case MENU.push: {
-      if (!engine.inRoom) return { toast: "请先加入一起听" };
-      if (!isNeteaseTrack(track)) return { toast: "仅支持推网易云在线歌曲" };
+      if (!engine.inRoom) return { error: "请先加入一起听" };
+      if (!isNeteaseTrack(track)) return { error: "仅支持推网易云在线歌曲" };
       try {
         await engine.pushSong(String(track.id));
-        if (ctx.getSetting(SETTING_PIN_AFTER_PUSH)) await engine.pinSong(String(track.id));
-        return { toast: `已推歌：${track.title}` };
+        if (ctx.getSetting(SETTING_PIN_AFTER_PUSH))
+          await engine.pinSong(String(track.id));
+        return { toast: `已推歌：${track.title}`, data: engine.snapshot };
       } catch (err) {
-        return { toast: err instanceof Error ? err.message : String(err) };
+        return { error: err instanceof Error ? err.message : String(err) };
       }
     }
     case MENU.pin: {
-      if (!engine.inRoom) return { toast: "请先加入一起听" };
-      if (!isNeteaseTrack(track)) return { toast: "仅支持置顶网易云在线歌曲" };
+      if (!engine.inRoom) return { error: "请先加入一起听" };
+      if (!isNeteaseTrack(track)) return { error: "仅支持置顶网易云在线歌曲" };
       try {
         await engine.pinSong(String(track.id));
-        return { toast: `已置顶：${track.title}` };
+        return { toast: `已置顶：${track.title}`, data: engine.snapshot };
       } catch (err) {
-        return { toast: err instanceof Error ? err.message : String(err) };
+        return { error: err instanceof Error ? err.message : String(err) };
       }
     }
     case MENU.goto: {
-      if (!engine.inRoom) return { toast: "请先加入一起听" };
-      if (!isNeteaseTrack(track)) return { toast: "仅支持播放网易云在线歌曲" };
+      if (!engine.inRoom) return { error: "请先加入一起听" };
+      if (!isNeteaseTrack(track)) return { error: "仅支持播放网易云在线歌曲" };
       try {
         await engine.goto(String(track.id));
-        return { toast: `已切歌：${track.title}` };
+        return { toast: `已切歌：${track.title}`, data: engine.snapshot };
       } catch (err) {
-        return { toast: err instanceof Error ? err.message : String(err) };
+        return { error: err instanceof Error ? err.message : String(err) };
       }
+    }
+    case MENU.next: {
+      if (!engine.inRoom) return { error: "请先加入一起听" };
+      try {
+        await engine.next();
+        return { data: engine.snapshot };
+      } catch (err) {
+        return { error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+    case MENU.ended: {
+      engine.onTrackEnded();
+      return { data: engine.snapshot };
     }
     default:
       return;
@@ -243,8 +296,11 @@ ctx.on("menuClick", async ({ menuId, track }) => {
 
 if (ctx.getSetting(SETTING_AUTO_JOIN)) {
   void joinFromSetting().catch((err) => {
-    ctx.log.warn("[一起听] 自动加入失败：", err instanceof Error ? err.message : err);
+    ctx.log.warn(
+      "[一起听] 自动加入失败：",
+      err instanceof Error ? err.message : err,
+    );
   });
 }
 
-ctx.log.info("[一起听] 插件已就绪");
+ctx.log.info("[多人一起听] 插件已就绪");

@@ -1,8 +1,8 @@
 /**
- * @name        网易云一起听
+ * @name        网易云多人一起听
  * @id          splayer.netease-together
- * @version     1.0.0
- * @description 加入网易云一起听房间，与手机/电脑用户同步播放，支持推歌与置顶
+ * @version     1.3.2
+ * @description 使用网易云官方多人房间，与手机端和其他 SPlayer 同步播放、推歌与置顶
  * @author      Sisyphus
  * @type        control
  * @apiLevel    4

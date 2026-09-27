@@ -25,16 +25,26 @@ export interface SplayerPlayer {
   getPosition(): Promise<number>;
   /** 加载并播放指定曲目（宿主扩展能力） */
   playTrack(track: TogetherTrack): void;
-  on<K extends PlaybackEventKind>(kind: K, handler: (data: PlaybackEventData[K]) => void): void;
+  on<K extends PlaybackEventKind>(
+    kind: K,
+    handler: (data: PlaybackEventData[K]) => void,
+  ): void;
 }
 
-export type PlaybackEventKind = "trackChange" | "lyricChange" | "lineChange" | "playStateChange";
+export type PlaybackEventKind =
+  | "trackChange"
+  | "lyricChange"
+  | "lineChange"
+  | "playStateChange";
 
 export interface PlaybackEventData {
   trackChange: { track: TogetherTrack | null };
   lyricChange: { lines: unknown[] };
   lineChange: { index: number; position: number };
-  playStateChange: { state: "playing" | "paused" | "stopped"; position: number };
+  playStateChange: {
+    state: "playing" | "paused" | "stopped";
+    position: number;
+  };
 }
 
 /** 插件声明的设置项（与宿主 PluginSettingItem 对齐的安全子集） */
@@ -60,14 +70,17 @@ export interface PluginMenuItem {
 /** 歌曲菜单点击入参 */
 export interface MenuClickReq {
   menuId: string;
-  track: TogetherTrack;
+  track?: TogetherTrack;
+  data?: unknown;
 }
 
 /** 菜单点击返回（宿主代为执行） */
 export interface MenuClickRes {
+  error?: string;
   toast?: string;
   openUrl?: string;
   copyText?: string;
+  data?: unknown;
 }
 
 /**
@@ -80,7 +93,10 @@ export interface SplayerContext {
   readonly appVersion: string;
 
   /** 调用网易云接口（宿主桥接，自动带登录态 + 加密 + 系统代理） */
-  callNetease<T = unknown>(name: string, params?: Record<string, unknown>): Promise<NeteaseResult<T>>;
+  callNetease<T = unknown>(
+    name: string,
+    params?: Record<string, unknown>,
+  ): Promise<NeteaseResult<T>>;
 
   /** 播放器控制面 */
   player: SplayerPlayer;
@@ -94,7 +110,10 @@ export interface SplayerContext {
   }): void;
 
   /** 注册动作处理器（menuClick） */
-  on(action: "menuClick", handler: (req: MenuClickReq) => Promise<MenuClickRes | void>): void;
+  on(
+    action: "menuClick",
+    handler: (req: MenuClickReq) => Promise<MenuClickRes | void>,
+  ): void;
 
   /** 读取用户设置 */
   getSetting<T = unknown>(key: string): T | undefined;
@@ -125,41 +144,94 @@ export interface TogetherTrack {
 
 /* ================= 一起听协议 ================= */
 
-export type PlayStatus = "PLAY" | "PAUSE";
-export type PlayCommandType = "GOTO" | "PLAY" | "PAUSE";
-export type ListCommandType = "ADD" | "REPLACE" | "PLAYMODE_CHANGE";
+export type MultiSongOperate = 1 | 2 | 4;
 
-/** 列表版本项：每个用户各持一个版本号 */
-export interface VersionEntry {
-  userId: string;
-  version: number;
+/** 多人房间队列中的歌曲。songBizId 是置顶和切歌操作需要的队列实例 id。 */
+export interface MultiSongInfo {
+  songId: string | number;
+  songBizId?: string | number;
+  songRcmdUid?: string | number;
+  rcmdType?: number;
+  alg?: string;
 }
 
-/** 房间播放指令（/sync/playlist/get 的 data.playCommand） */
-export interface PlayCommand {
-  targetSongId: string | number;
-  /** 单调递增的播放指令序号，冲突时以更大者为准 */
-  clientSeq: number;
-  playStatus?: PlayStatus;
-  /** 指令下达时的播放进度（毫秒） */
-  progress?: number;
-  /** 服务端可能下发的时间戳（毫秒）；不存在时用本地外推补偿 */
-  updateTime?: number;
-  [key: string]: unknown;
+/** multi 心跳返回的当前播放状态。多人房间由服务端时间线持续推进。 */
+export interface MultiRoomSongInfo {
+  playSong?: MultiSongInfo;
+  nextSongs?: MultiSongInfo[];
+  playedTime?: number;
+  songDuration?: number;
+  version?: number;
+  forceSync?: boolean;
+  waitSongCount?: number;
 }
 
-/** 房间播放列表 */
-export interface RoomPlaylist {
-  version?: VersionEntry[];
-  playMode?: string;
-  displayList?: { result?: Array<{ songId: string | number } | string | number> };
-  [key: string]: unknown;
+export interface MultiRoomUserList {
+  onlineNums?: number;
+  onlineUserInfos?: Array<{
+    userId?: string | number;
+    uid?: string | number;
+    nickname?: string;
+    avatarUrl?: string;
+    avatar?: string;
+  }>;
 }
 
-/** /sync/playlist/get 的 data */
-export interface RoomState {
-  playCommand: PlayCommand;
-  playlist: RoomPlaylist;
+export interface MultiRoomInfoDto {
+  roomId?: string;
+  creatorId?: string | number;
+  roomType?: string;
+  roomBizType?: number;
+  roomStatus?: number;
+  roomClosed?: boolean;
+}
+
+/** multi/room/create 与 multi/match/ack 返回的官方房间快照。 */
+export interface MultiRoomSnapshot {
+  roomId?: string;
+  multiRoomInfoDTO?: MultiRoomInfoDto;
+  roomPlaySongInfo?: MultiRoomSongInfo;
+  multiLtRoomUserAgg?: MultiRoomUserList;
+}
+
+export interface MultiRoomAckData {
+  success?: boolean;
+  failedType?: string;
+  failedMessage?: string;
+  message?: string;
+  existRoomId?: string;
+  multiLtRoomSnapshot?: MultiRoomSnapshot;
+  nextAddSongDuration?: number;
+}
+
+export interface MultiHeartbeatData {
+  roomPlaySongInfo?: MultiRoomSongInfo;
+  roomInfoDTO?: MultiRoomInfoDto;
+  heartBeatDuration?: number;
+  nextAddSongDuration?: number;
+  realOnlineTime?: number;
+}
+
+export interface MultiSongOperateData {
+  failedMsg?: string;
+  failedCode?: number;
+  roomSongInfo?: MultiRoomSongInfo;
+  operateSongId?: string | number;
+  operateSongBizId?: string | number;
+  nextAddSongDuration?: number;
+}
+
+/** 官方多人房间推荐消息内的歌曲置顶信息。 */
+export interface MultiRoomMessageHistory {
+  records?: Array<{
+    sendTime?: number;
+    resourceInfo?: {
+      bizId?: string | number;
+      resourceId?: string | number;
+      upCnt?: number;
+      uped?: boolean;
+    };
+  }>;
 }
 
 /** 网易云歌曲详情（song_detail 返回） */

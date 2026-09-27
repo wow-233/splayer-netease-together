@@ -1,154 +1,100 @@
-/**
- * sync.ts — 一起听同步引擎
- *
- * 解决四类问题：
- * 1. 时钟同步与防抖动：以云端 clientSeq 为准（更大者胜），本地操作乐观覆盖；
- *    应用云端指令后进入「回声抑制窗口」，避免把云端刚下达的状态再报回去。
- * 2. 风控与频率限制：自适应退避轮询（非固定 3s），本地暂停时降低上报频率，
- *    心跳按需节流；命中风控时放大间隔。
- * 3. 权限边界：所有网易云调用经 splayerContext.callNetease（宿主桥接，自动带登录态）。
- * 4. 断线重连与状态补偿：重连后按 clientSeq/progress/playStatus 重算目标位置，
- *    半 RTT 补偿 + 本地外推，直接 seek 到目标而不是从 0 播放。
- *
- * 纯决策函数（bumpVersion / shouldApplyCloud / computeExpectedPosition /
- * nextPollDelay）不依赖计时器，可单测；计时循环见 TogetherSyncEngine。
- */
+/** 官方网易云“多人一起听”房间同步引擎。 */
 
-import { createNeteaseApi, isRateLimited, toTogetherTrack, type NeteaseApi } from "./neteaseApi";
+import {
+  createNeteaseApi,
+  isRateLimited,
+  NeteaseApiError,
+  toTogetherTrack,
+  type NeteaseApi,
+} from "./neteaseApi";
 import type {
-  PlayCommand,
-  PlayStatus,
+  MultiRoomSnapshot,
+  MultiRoomSongInfo,
+  MultiSongInfo,
+  PlaybackEventData,
   SplayerContext,
   TogetherTrack,
-  VersionEntry,
 } from "./types";
 
-/* ================= 可调常量 ================= */
+const DEFAULT_HEARTBEAT_MS = 20_000;
+const MIN_HEARTBEAT_MS = 2_000;
+const MAX_HEARTBEAT_MS = 30_000;
+const SEEK_THRESHOLD_MS = 2_000;
+const MAX_BACKOFF = 4;
 
-/** 播放中轮询间隔 */
-const POLL_PLAYING_MS = 1500;
-/** 本地暂停时轮询间隔（降低频率，规避风控） */
-const POLL_PAUSED_MS = 5000;
-/** 未在房间时轮询间隔 */
-const POLL_IDLE_MS = 10000;
-/** 轮询间隔上限（退避封顶） */
-const POLL_MAX_MS = 30000;
-/** 进度差超过该阈值才 seek，避免抖动 */
-const SEEK_THRESHOLD_MS = 2000;
-/** 应用云端指令后，此时长内的本地事件视为回声，不上报 */
-const ECHO_SUPPRESS_MS = 1200;
-/** 本地操作后的乐观覆盖窗口：期间忽略不更新的云端指令 */
-const LOCAL_OVERRIDE_MS = 1500;
-/** 本地上报去抖 */
-const LOCAL_DEBOUNCE_MS = 400;
-/** 本地位置采样间隔（检测用户拖动） */
-const LOCAL_SAMPLE_MS = 3000;
-/** 播放中心跳间隔 */
-const HEARTBEAT_PLAYING_MS = 30000;
-/** 暂停时心跳间隔（更长，降低频率） */
-const HEARTBEAT_PAUSED_MS = 120000;
-/** 风控退避放大系数 */
-const BACKOFF_FACTOR = 1.7;
+export interface ParsedRoomLink {
+  roomId?: string;
+  inviterId?: string;
+  songId?: string;
+  isMultiRoom: boolean;
+}
 
-/* ================= 纯决策函数（可单测） ================= */
-
-/**
- * 递增「发送方自己」的列表版本号；首次参与则新增一条 version=1。
- * 复用未递增的版本是两端列表不同步的最常见原因。
- */
-export const bumpVersion = (versions: VersionEntry[], selfUserId: string): VersionEntry[] => {
-  const out = versions.map((v) => ({ ...v }));
-  const mine = out.find((v) => String(v.userId) === String(selfUserId));
-  if (mine) mine.version = Number(mine.version) + 1;
-  else out.push({ userId: String(selfUserId), version: 1 });
-  return out;
+export const parseRoomLink = (input: string): ParsedRoomLink => {
+  const text = String(input ?? "").trim();
+  if (!text) return { isMultiRoom: false };
+  try {
+    // 手机分享可能是整段文案、Markdown 链接，且转发时会转义 _ 和 &。
+    const candidate = text.match(/https?:\/\/[^\s<>\])]+/i)?.[0] ?? text;
+    const url = new URL(candidate.replace(/\\([_&?=])/g, "$1").replace(/[。，,;；]+$/, ""));
+    const roomId = url.searchParams.get("roomId") || undefined;
+    const inviterId =
+      url.searchParams.get("inviterUid") ||
+      url.searchParams.get("inviterId") ||
+      undefined;
+    const songId = url.searchParams.get("songId") || undefined;
+    return {
+      ...(roomId ? { roomId } : {}),
+      ...(inviterId ? { inviterId } : {}),
+      ...(songId ? { songId } : {}),
+      isMultiRoom: /\/listen-together\/multishare(?:\/|$)/i.test(url.pathname),
+    };
+  } catch {
+    return { isMultiRoom: false };
+  }
 };
 
-/**
- * 是否应用云端指令：
- * - clientSeq 更大 → 应用（云端最新指令胜出）
- * - 本地乐观覆盖窗口内且 seq 未前进 → 暂不应用（本地操作平滑覆盖）
- * - 否则不应用
- */
-export const shouldApplyCloud = (args: {
-  cloudSeq: number;
-  lastAppliedSeq: number;
-  now: number;
-  overrideUntil: number;
-}): boolean => {
-  if (args.cloudSeq > args.lastAppliedSeq) return true;
-  if (args.now < args.overrideUntil && args.cloudSeq <= args.lastAppliedSeq) return false;
-  return false;
+export const buildMultiShareLink = (
+  roomId: string,
+  inviterUid: string,
+  songId?: string,
+): string => {
+  const params = new URLSearchParams({ roomId, inviterUid });
+  if (songId) params.set("songId", songId);
+  return `https://st.music.163.com/listen-together/multishare/index.html?${params.toString()}`;
 };
 
-/**
- * 计算云端指令对应的「当前应有位置」：
- * progress 是指令下达时刻的进度，需叠加指令到达后的播放时长；播放态才外推。
- * @param halfRttMs 请求往返的一半，用于抵消网络延迟
- */
-export const computeExpectedPosition = (args: {
-  command: Pick<PlayCommand, "progress" | "playStatus">;
-  appliedAt: number;
-  now: number;
-  halfRttMs: number;
-}): number => {
-  const base = Number(args.command.progress ?? 0);
-  const playing = args.command.playStatus === "PLAY";
-  const elapsed = Math.max(0, args.now - args.appliedAt) + Math.max(0, args.halfRttMs);
-  return playing ? base + elapsed : base;
-};
-
-/** 是否需要 seek：进度差超过阈值（避免频繁微调造成抖动） */
 export const needsSeek = (localPos: number, expectedPos: number): boolean =>
   Math.abs(localPos - expectedPos) > SEEK_THRESHOLD_MS;
 
-/** 计算下一次轮询延迟（含抖动），并在命中风控时退避放大 */
-export const nextPollDelay = (args: {
-  inRoom: boolean;
-  paused: boolean;
-  backoff: number;
-  jitter: number;
-}): number => {
-  const base = !args.inRoom ? POLL_IDLE_MS : args.paused ? POLL_PAUSED_MS : POLL_PLAYING_MS;
-  const capped = Math.min(base * Math.max(1, args.backoff), POLL_MAX_MS);
-  return Math.round(capped * args.jitter);
+export const expectedMultiPosition = (
+  playedTime: number | undefined,
+  halfRttMs: number,
+): number => Math.max(0, Number(playedTime ?? 0) + Math.max(0, halfRttMs));
+
+export const nextHeartbeatDelay = (
+  serverSeconds: number | undefined,
+  backoff = 1,
+): number => {
+  const serverMs = Number(serverSeconds) * 1000;
+  const base =
+    Number.isFinite(serverMs) && serverMs > 0 ? serverMs : DEFAULT_HEARTBEAT_MS;
+  return Math.round(
+    Math.min(
+      MAX_HEARTBEAT_MS,
+      Math.max(MIN_HEARTBEAT_MS, base * Math.max(1, backoff)),
+    ),
+  );
 };
 
-/** 从分享链接解析 roomId / inviterId / songId（兼容 inviterId 与 multishare 的 inviterUid） */
-export const parseRoomLink = (input: string): { roomId?: string; inviterId?: string; songId?: string } => {
-  const text = String(input ?? "").trim();
-  if (!text) return {};
-  const match = text.match(/[?&]roomId=([^&]+)/i);
-  const inviter = text.match(/[?&](?:inviterUid|inviterId|uid)=([^&]+)/i);
-  const song = text.match(/[?&]songId=([^&]+)/i);
-  const pick = (m: RegExpMatchArray | null): string | undefined =>
-    m ? decodeURIComponent(m[1] ?? "") : undefined;
-  const out: { roomId?: string; inviterId?: string; songId?: string } = {};
-  const roomId = pick(match);
-  const inviterId = pick(inviter);
-  const songId = pick(song);
-  if (roomId) out.roomId = roomId;
-  if (inviterId) out.inviterId = inviterId;
-  if (songId) out.songId = songId;
-  return out;
+export const roomSongIds = (info?: MultiRoomSongInfo): string[] => {
+  const songs = [info?.playSong, ...(info?.nextSongs ?? [])];
+  return songs
+    .filter((song): song is MultiSongInfo => song?.songId !== undefined)
+    .map((song) => String(song.songId));
 };
-
-/** 从播放列表取展示歌曲 id 数组 */
-export const displaySongIds = (state: {
-  playlist?: { displayList?: { result?: Array<{ songId: string | number } | string | number> } };
-}): string[] => {
-  const result = state.playlist?.displayList?.result ?? [];
-  return result
-    .map((item) => (typeof item === "object" && item !== null ? item.songId : item))
-    .filter((v) => v !== undefined && v !== null)
-    .map((v) => String(v));
-};
-
-/* ================= 同步引擎 ================= */
 
 export interface SyncEngineOptions {
   ctx: SplayerContext;
-  /** 轮询/心跳定时器（默认全局，测试可注入假实现） */
   timers?: {
     setTimeout: (cb: () => void, ms: number) => unknown;
     clearTimeout: (handle: unknown) => void;
@@ -156,41 +102,36 @@ export interface SyncEngineOptions {
   };
 }
 
-interface PendingReport {
-  commandType: "GOTO" | "PLAY" | "PAUSE";
-  progress: number;
-}
-
 export class TogetherSyncEngine {
   private readonly api: NeteaseApi;
   private readonly ctx: SplayerContext;
   private readonly timers: NonNullable<SyncEngineOptions["timers"]>;
-
   private roomId: string | null = null;
   private inviterId: string | null = null;
   private selfUserId = "";
-
-  private lastAppliedSeq = -1;
   private currentSongId: string | null = null;
-  private lastApplied: { progress: number; playing: boolean; at: number } | null = null;
-
-  private echoUntil = 0;
-  private overrideUntil = 0;
+  private playlist: MultiSongInfo[] = [];
+  private readonly songCache = new Map<string, TogetherTrack>();
+  private readonly pinCounts = new Map<string, number>();
+  private historyCheckedAt = Number.NEGATIVE_INFINITY;
+  private historyLoading: Promise<void> | null = null;
+  private playedSongs: string[] = [];
+  private memberCount = 1;
+  private members: Array<{ userId: string; nickname: string; avatarUrl?: string }> = [];
   private paused = false;
-  private backoff = 1;
-
-  private pollHandle: unknown = null;
-  private heartbeatHandle: unknown = null;
-  private sampleHandle: unknown = null;
-  private reportHandle: unknown = null;
-  private pendingReport: PendingReport | null = null;
-
-  private lastSample = { pos: 0, at: 0, playing: false };
-  private pendingSeek: { songId: string; position: number } | null = null;
-
   private running = false;
-  private versions: VersionEntry[] = [];
-  private playlist: string[] = [];
+  private version = -1;
+  private heartbeatMs = DEFAULT_HEARTBEAT_MS;
+  private backoff = 1;
+  private heartbeatHandle: unknown = null;
+  private endedSongId: string | null = null;
+  private endedFastPolls = 0;
+  private pendingPlayback: {
+    songId: string;
+    position: number;
+    playing: boolean;
+    at: number;
+  } | null = null;
 
   constructor(opts: SyncEngineOptions) {
     this.ctx = opts.ctx;
@@ -199,415 +140,592 @@ export class TogetherSyncEngine {
       opts.timers ??
       ({
         setTimeout: (cb, ms) => setTimeout(cb, ms),
-        clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+        clearTimeout: (handle) =>
+          clearTimeout(handle as ReturnType<typeof setTimeout>),
         now: () => Date.now(),
       } as NonNullable<SyncEngineOptions["timers"]>);
   }
 
-  /* ---------- 生命周期 ---------- */
+  async create(
+    initialTrack?: TogetherTrack,
+  ): Promise<{ roomId: string; creatorId: string; resumed: boolean }> {
+    if (this.running) throw new Error("已在多人一起听房间中，请先退出");
+    const selfUserId = await this.resolveSelfUserId();
+    // 桌面端重启后内存状态会丢失，但网易云账号仍可能在官方房间。
+    if (await this.resumeExistingRoom(selfUserId)) {
+      return { roomId: this.roomId!, creatorId: selfUserId, resumed: true };
+    }
+    if (!initialTrack?.id) throw new Error("请先播放一首网易云在线歌曲");
+    const playedTime = await this.ctx.player.getPosition();
+    const data = await this.api.createRoom({
+      songId: String(initialTrack.id),
+      playedTime,
+      nextSongIds: [],
+    });
+    if (data.failedType === "MULTI_ACK_ALREADY_IN_ROOM" || data.existRoomId) {
+      if (await this.resumeExistingRoom(selfUserId, data.existRoomId)) {
+        return { roomId: this.roomId!, creatorId: selfUserId, resumed: true };
+      }
+      throw new Error("网易云账号已在其他多人房间，请先在手机端退出该房间后再创建");
+    }
+    this.assertRoomAccepted(data, "创建");
+    const snapshot = data.multiLtRoomSnapshot;
+    const roomId = snapshot?.roomId ?? snapshot?.multiRoomInfoDTO?.roomId;
+    if (!roomId) throw new Error("创建多人房间失败：服务端未返回房间号");
+    this.startRoom(String(roomId), selfUserId, selfUserId, snapshot);
+    this.currentSongId = String(initialTrack.id);
+    if (!this.playlist.length) this.playlist = [{ songId: initialTrack.id }];
+    if (snapshot?.roomPlaySongInfo) {
+      await this.applyRoomSongInfo(snapshot.roomPlaySongInfo, 0, true);
+    }
+    // 创建房间时原曲可能已经暂停；若服务端换了曲，则由 loadTrack 负责播放。
+    if (this.currentSongId === String(initialTrack.id)) this.ctx.player.play();
+    this.scheduleHeartbeat(0);
+    this.ctx.log.info(`[多人一起听] 已创建房间 ${roomId}`);
+    return { roomId: String(roomId), creatorId: selfUserId, resumed: false };
+  }
 
-  /** 解析房间链接并加入；成功后启动同步循环 */
-  async join(roomLinkOrRoomId: string, inviterIdArg?: string): Promise<void> {
-    const parsed = parseRoomLink(roomLinkOrRoomId);
-    const roomId = parsed.roomId ?? roomLinkOrRoomId.trim();
+  async resume(): Promise<boolean> {
+    if (this.inRoom) return true;
+    return this.resumeExistingRoom(await this.resolveSelfUserId());
+  }
+
+  async join(roomLink: string, inviterIdArg?: string): Promise<void> {
+    if (this.running) throw new Error("已在多人一起听房间中，请先退出");
+    const parsed = parseRoomLink(roomLink);
+    if (!parsed.isMultiRoom) {
+      throw new Error(
+        "这不是多人一起听链接，请使用包含 multishare 的官方多人邀请链接",
+      );
+    }
+    const roomId = parsed.roomId;
     const inviterId = inviterIdArg ?? parsed.inviterId;
-    if (!roomId || !inviterId) throw new Error("房间链接缺少 roomId 或 inviterId");
-
-    await this.acceptWithFallback(roomId, inviterId);
-    this.roomId = roomId;
-    this.inviterId = inviterId;
-    this.selfUserId = await this.resolveSelfUserId();
-    this.running = true;
-    this.backoff = 1;
-    this.lastAppliedSeq = -1;
-    this.ctx.log.info(`[一起听] 已加入房间 ${roomId}`);
-    await this.reconcile(true);
-    this.schedulePoll();
-    this.scheduleHeartbeat();
-    this.scheduleSample();
-  }
-
-  /** 依次尝试多种 refer 接受邀请（multishare 用 third_party_invite，收件箱邀请用 inbox_invite） */
-  private async acceptWithFallback(roomId: string, inviterId: string): Promise<void> {
-    const refers = ["third_party_invite", "inbox_invite"];
-    let lastErr: unknown;
-    for (const refer of refers) {
-      try {
-        await this.api.accept(roomId, inviterId, refer);
-        this.ctx.log.info(`[一起听] accept 成功（refer=${refer}）`);
-        return;
-      } catch (err) {
-        lastErr = err;
-        this.ctx.log.warn(
-          `[一起听] accept 失败（refer=${refer}）：`,
-          err instanceof Error ? err.message : err,
-        );
+    if (!roomId || !inviterId)
+      throw new Error("邀请链接缺少 roomId 或 inviterUid");
+    const selfUserId = await this.resolveSelfUserId();
+    const data = await this.api.joinRoom(roomId, inviterId);
+    if (data.failedType === "MULTI_ACK_ALREADY_IN_ROOM" || data.existRoomId) {
+      if (data.existRoomId && String(data.existRoomId) !== String(roomId)) {
+        throw new Error("网易云账号仍在另一个多人房间，请先退出原房间后再加入邀请房间");
       }
+      if (await this.resumeExistingRoom(selfUserId, roomId)) return;
+      throw new Error("网易云账号已在其他多人房间，请先在手机端退出后再加入");
     }
-    // 接受失败多半是房间已失效/过期（一起听房间有效期约 30 分钟）
-    throw new Error(
-      "加入失败：房间可能已失效或链接过期（一起听房间有效期约 30 分钟）。" +
-        "请让好友重新发起，或用「创建一起听房间」由本机建房。",
-    );
+    this.assertRoomAccepted(data, "加入");
+    const snapshot = data.multiLtRoomSnapshot;
+    const acceptedRoomId =
+      snapshot?.roomId ?? snapshot?.multiRoomInfoDTO?.roomId ?? roomId;
+    this.startRoom(String(acceptedRoomId), selfUserId, selfUserId, snapshot);
+    if (snapshot?.roomPlaySongInfo) {
+      await this.applyRoomSongInfo(snapshot.roomPlaySongInfo, 0, true);
+    }
+    await this.runHeartbeat();
+    this.ctx.log.info(`[多人一起听] 已加入房间 ${acceptedRoomId}`);
   }
 
-  /** 由本机创建一起听房间（HTTP 可用），返回房间信息以便分享 */
-  async create(): Promise<{ roomId: string; creatorId: string }> {
-    const info = await this.api.roomCreate();
-    if (!info.roomId || !info.creatorId) throw new Error("创建房间失败：未返回 roomId/creatorId");
-    this.roomId = String(info.roomId);
-    this.inviterId = String(info.creatorId);
-    this.selfUserId = String(info.creatorId);
-    this.running = true;
-    this.backoff = 1;
-    this.lastAppliedSeq = -1;
-    this.lastApplied = null;
-    this.currentSongId = null;
-    await this.reconcile(true);
-    this.schedulePoll();
-    this.scheduleHeartbeat();
-    this.scheduleSample();
-    this.ctx.log.info(`[一起听] 已创建房间 ${this.roomId}`);
-    return { roomId: this.roomId, creatorId: this.inviterId };
-  }
-
-  /** 离开房间并停止所有计时器 */
   async leave(): Promise<void> {
-    this.running = false;
-    this.clearTimers();
-    if (this.roomId) {
-      try {
-        await this.api.end(this.roomId);
-      } catch (err) {
-        this.ctx.log.warn("[一起听] 离开房间失败：", err instanceof Error ? err.message : err);
-      }
+    const roomId = this.roomId;
+    this.resetRoom();
+    if (!roomId) return;
+    try {
+      await this.api.leaveRoom(roomId);
+    } catch (error) {
+      this.ctx.log.warn(
+        "[多人一起听] 退出房间请求失败：",
+        error instanceof Error ? error.message : error,
+      );
     }
-    this.roomId = null;
-    this.currentSongId = null;
-    this.lastAppliedSeq = -1;
-    this.lastApplied = null;
   }
 
   get inRoom(): boolean {
     return this.running && this.roomId !== null;
   }
 
-  /* ---------- 主循环 ---------- */
-
-  private schedulePoll(): void {
-    if (!this.running) return;
-    const delay = nextPollDelay({
-      inRoom: this.roomId !== null,
+  get snapshot(): {
+    inRoom: boolean;
+    mode: "multi";
+    roomId: string | null;
+    inviterId: string | null;
+    currentSongId: string | null;
+    playlistLength: number;
+    memberCount: number;
+    members: Array<{ userId: string; nickname: string; avatarUrl?: string }>;
+    paused: boolean;
+    queue: Array<{ songId: string; track?: TogetherTrack; recommendedBy?: string; pinCount?: number }>;
+    played: Array<{ songId: string; track?: TogetherTrack }>;
+  } {
+    return {
+      inRoom: this.inRoom,
+      mode: "multi",
+      roomId: this.roomId,
+      inviterId: this.inviterId,
+      currentSongId: this.currentSongId,
+      playlistLength: this.playlist.length,
+      memberCount: this.memberCount,
+      members: this.members,
       paused: this.paused,
-      backoff: this.backoff,
-      jitter: 0.8 + Math.random() * 0.4,
-    });
-    this.pollHandle = this.timers.setTimeout(() => void this.tick(), delay);
-  }
-
-  private async tick(): Promise<void> {
-    try {
-      await this.reconcile(false);
-      this.backoff = 1;
-    } catch (err) {
-      if (isRateLimited(err)) {
-        this.backoff = Math.min(this.backoff * BACKOFF_FACTOR, POLL_MAX_MS / POLL_PLAYING_MS);
-        this.ctx.log.warn("[一起听] 疑似风控，退避至 x" + this.backoff.toFixed(2));
-      } else {
-        this.ctx.log.warn("[一起听] 轮询失败：", err instanceof Error ? err.message : err);
-      }
-    } finally {
-      this.schedulePoll();
-    }
-  }
-
-  /** 拉取房间状态并应用/纠偏（reconnect 时强制全量重算） */
-  async reconcile(force: boolean): Promise<void> {
-    if (!this.roomId) return;
-    const t0 = this.timers.now();
-    const state = await this.api.getPlaylist(this.roomId);
-    const t1 = this.timers.now();
-    const halfRtt = Math.max(0, (t1 - t0) / 2);
-
-    const cmd = state?.playCommand;
-    if (!cmd) return;
-    const cloudSeq = Number(cmd.clientSeq ?? 0);
-
-    this.versions = state?.playlist?.version ?? [];
-    this.playlist = displaySongIds(state ?? {});
-
-    if (force || shouldApplyCloud({ cloudSeq, lastAppliedSeq: this.lastAppliedSeq, now: t1, overrideUntil: this.overrideUntil })) {
-      this.lastAppliedSeq = cloudSeq;
-      this.applyCloudCommand(cmd, halfRtt, t1);
-      return;
-    }
-
-    // 同一首：仅做漂移校正（含重连后的补偿）
-    if (String(cmd.targetSongId) === this.currentSongId && this.lastApplied) {
-      await this.correctDrift(cmd, t1);
-    }
-  }
-
-  /** 应用云端播放指令：切歌 / 定位 / 播放暂停 */
-  private applyCloudCommand(cmd: PlayCommand, halfRtt: number, now: number): void {
-    const targetId = String(cmd.targetSongId);
-    const playing = cmd.playStatus === "PLAY";
-    this.paused = !playing;
-    this.echoUntil = now + ECHO_SUPPRESS_MS;
-
-    if (targetId !== this.currentSongId) {
-      this.currentSongId = targetId;
-      this.lastApplied = { progress: Number(cmd.progress ?? 0), playing, at: now };
-      this.pendingSeek = { songId: targetId, position: computeExpectedPosition({ command: cmd, appliedAt: now, now, halfRttMs: halfRtt }) };
-      void this.loadTrack(targetId, playing);
-    } else {
-      this.lastApplied = { progress: Number(cmd.progress ?? 0), playing, at: now };
-      void this.alignLocal(computeExpectedPosition({ command: cmd, appliedAt: now, now, halfRttMs: halfRtt }), playing);
-    }
-  }
-
-  /** 加载歌曲并（尽量）定位到目标位置 */
-  private async loadTrack(songId: string, playing: boolean): Promise<void> {
-    try {
-      const songs = await this.api.songDetail([songId]);
-      const song = songs[0];
-      if (!song) throw new Error("song_detail 无结果");
-      const track: TogetherTrack = toTogetherTrack(song);
-      this.ctx.player.playTrack(track);
-      // 播放器加载是异步的；先乐观播放，位置交由 playStateChange/后续纠偏落地
-      if (playing) this.ctx.player.play();
-      else this.ctx.player.pause();
-    } catch (err) {
-      this.ctx.log.error("[一起听] 加载歌曲失败：", err instanceof Error ? err.message : err);
-    }
-  }
-
-  /** 定位本地播放器到目标位置并对齐播放态 */
-  private async alignLocal(expected: number, playing: boolean): Promise<void> {
-    const pos = await this.ctx.player.getPosition();
-    if (needsSeek(pos, expected)) {
-      this.echoUntil = this.timers.now() + ECHO_SUPPRESS_MS;
-      this.ctx.player.seek(Math.max(0, Math.round(expected)));
-    }
-    if (playing) this.ctx.player.play();
-    else this.ctx.player.pause();
-  }
-
-  /** 同一首歌的漂移校正：以本地外推的期望位置为准，超过阈值才 seek */
-  private async correctDrift(cmd: PlayCommand, now: number): Promise<void> {
-    if (!this.lastApplied) return;
-    const playing = cmd.playStatus === "PLAY" || this.lastApplied.playing;
-    const expected = computeExpectedPosition({
-      command: { progress: this.lastApplied.progress, playStatus: playing ? "PLAY" : "PAUSE" },
-      appliedAt: this.lastApplied.at,
-      now,
-      halfRttMs: 0,
-    });
-    const pos = await this.ctx.player.getPosition();
-    if (needsSeek(pos, expected)) {
-      this.echoUntil = now + ECHO_SUPPRESS_MS;
-      this.ctx.player.seek(Math.max(0, Math.round(expected)));
-    }
-  }
-
-  /* ---------- 本地事件 → 上报（防抖 + 回声抑制 + 乐观覆盖） ---------- */
-
-  /** 由 index.ts 转发宿主播放事件 */
-  onLocalEvent(kind: "playStateChange" | "lineChange", data: { state?: string; position: number }): void {
-    if (!this.running || !this.roomId) return;
-    const now = this.timers.now();
-
-    if (kind === "playStateChange" && data.state) {
-      this.paused = data.state !== "playing";
-      if (now < this.echoUntil) return; // 云端回声，不上报
-      if (data.state === "playing") this.scheduleReport({ commandType: "PLAY", progress: data.position });
-      else if (data.state === "paused") this.scheduleReport({ commandType: "PAUSE", progress: data.position });
-      return;
-    }
-
-    if (kind === "lineChange") {
-      this.observeLocalPosition(data.position, now);
-    }
-  }
-
-  /** 采样本地位置，检测用户拖动进度条并即时上报 */
-  private observeLocalPosition(pos: number, now: number): void {
-    const wasPlaying = this.lastSample.playing;
-    const expected = this.lastSample.pos + (wasPlaying ? now - this.lastSample.at : 0);
-    const jumped = this.lastSample.at > 0 && Math.abs(pos - expected) > SEEK_THRESHOLD_MS;
-    this.lastSample = { pos, at: now, playing: !this.paused };
-    if (now < this.echoUntil) return;
-    if (jumped) {
-      this.scheduleReport({
-        commandType: "GOTO",
-        progress: Math.max(0, Math.round(pos)),
-      });
-    }
-  }
-
-  private scheduleReport(report: PendingReport): void {
-    this.pendingReport = report;
-    if (this.reportHandle) this.timers.clearTimeout(this.reportHandle);
-    this.reportHandle = this.timers.setTimeout(() => void this.flushReport(), LOCAL_DEBOUNCE_MS);
-  }
-
-  /** 去抖后上报本地操作；上报后进入乐观覆盖窗口，本地状态暂时优先 */
-  private async flushReport(): Promise<void> {
-    const report = this.pendingReport;
-    this.pendingReport = null;
-    if (!report || !this.roomId) return;
-    const now = this.timers.now();
-    this.overrideUntil = now + LOCAL_OVERRIDE_MS;
-    // 乐观推进本地序号，使云端回显的旧指令不覆盖本地
-    this.lastAppliedSeq = Math.max(this.lastAppliedSeq + 1, this.lastAppliedSeq);
-    this.lastApplied = {
-      progress: report.progress,
-      playing: report.commandType !== "PAUSE",
-      at: now,
+      queue: this.playlist.map((song) => ({
+        songId: String(song.songId),
+        track: this.songCache.get(String(song.songId)),
+        recommendedBy: song.songRcmdUid ? String(song.songRcmdUid) : undefined,
+        pinCount: song.songBizId === undefined ? undefined : this.pinCounts.get(String(song.songBizId)),
+      })),
+      played: this.playedSongs.map((songId) => ({
+        songId,
+        track: this.songCache.get(songId),
+      })),
     };
-    try {
-      await this.api.reportPlay(this.roomId, {
-        commandType: report.commandType,
-        progress: Math.round(report.progress),
-        playStatus: report.commandType === "PAUSE" ? "PAUSE" : "PLAY",
-        formerSongId: this.currentSongId ?? "",
-        targetSongId: this.currentSongId ?? "",
-        clientSeq: this.lastAppliedSeq,
+  }
+
+  async detailedSnapshot() {
+    if (this.inRoom) await this.refreshPinCounts();
+    const ids = [...this.playlist.map((song) => String(song.songId)), ...this.playedSongs];
+    const missing = [...new Set(ids)].filter((id) => !this.songCache.has(id)).slice(0, 50);
+    if (missing.length) {
+      try {
+        for (const song of await this.api.songDetail(missing)) {
+          this.songCache.set(String(song.id), toTogetherTrack(song));
+        }
+        while (this.songCache.size > 100) {
+          const oldest = this.songCache.keys().next().value;
+          if (oldest === undefined) break;
+          this.songCache.delete(oldest);
+        }
+      } catch (error) {
+        this.ctx.log.warn("[多人一起听] 读取房间歌曲信息失败：", error);
+      }
+    }
+    return this.snapshot;
+  }
+
+  onLocalEvent(
+    kind: "playStateChange" | "lineChange",
+    data: {
+      state?: PlaybackEventData["playStateChange"]["state"];
+      position: number;
+    },
+  ): void {
+    if (!this.running || kind !== "playStateChange" || !data.state) return;
+    this.paused = data.state !== "playing";
+  }
+
+  async pushSong(songId: string): Promise<void> {
+    const roomId = this.requireRoom();
+    const id = String(songId);
+    if (this.findSong(id)) return;
+    const data = await this.api.operateSong(roomId, id, "0", 1);
+    if (data.roomSongInfo) {
+      this.updateRoomQueue(data.roomSongInfo, false);
+    }
+    if (!this.findSong(id)) {
+      this.playlist.push({
+        songId: data.operateSongId ?? id,
+        songBizId: data.operateSongBizId,
       });
-    } catch (err) {
-      this.ctx.log.warn("[一起听] 上报播放状态失败：", err instanceof Error ? err.message : err);
+    }
+    this.ctx.log.info(`[多人一起听] 已推歌 ${id}`);
+  }
+
+  async pinSong(songId: string): Promise<void> {
+    const roomId = this.requireRoom();
+    const id = String(songId);
+    let song = this.findSong(id);
+    if (!song?.songBizId) {
+      await this.runHeartbeat(false);
+      song = this.findSong(id);
+    }
+    if (!song) throw new Error("这首歌尚未加入多人房间");
+    if (!song.songBizId)
+      throw new Error("房间尚未返回这首歌的队列编号，请稍后再试");
+    const data = await this.api.operateSong(
+      roomId,
+      id,
+      String(song.songBizId),
+      2,
+    );
+    if (data.roomSongInfo) this.updateRoomQueue(data.roomSongInfo, false);
+    this.historyCheckedAt = Number.NEGATIVE_INFINITY;
+    await this.refreshPinCounts();
+  }
+
+  async goto(songId: string, loadLocally = true): Promise<void> {
+    const roomId = this.requireRoom();
+    const id = String(songId);
+    if (!this.findSong(id)) await this.pushSong(id);
+    let song = this.findSong(id);
+    if (!song?.songBizId) {
+      await this.runHeartbeat(false);
+      song = this.findSong(id);
+    }
+    if (!song?.songBizId)
+      throw new Error("房间尚未返回这首歌的队列编号，请稍后再试");
+    const data = await this.api.operateSong(
+      roomId,
+      id,
+      String(song.songBizId),
+      4,
+    );
+    if (data.roomSongInfo) this.updateRoomQueue(data.roomSongInfo, false);
+    // 歌曲操作成功后，以请求的歌曲为目标；操作响应可能仍是切换前的快照。
+    this.recordPlayed(id);
+    const selected = this.findSong(id) ?? song;
+    if (selected) this.playlist = [selected, ...this.playlist.filter((song) => String(song.songId) !== id)];
+    this.currentSongId = id;
+    this.paused = false;
+    this.pendingPlayback = {
+      songId: id,
+      position: 0,
+      playing: true,
+      at: this.timers.now(),
+    };
+    if (loadLocally) await this.loadTrack(id);
+    this.scheduleHeartbeat(1500);
+  }
+
+  async next(): Promise<void> {
+    this.requireRoom();
+    const previousId = this.currentSongId;
+    await this.runHeartbeat(false);
+    if (!this.inRoom || this.currentSongId !== previousId) return;
+    const next = this.playlist.find((song) => String(song.songId) !== this.currentSongId);
+    if (!next) {
+      this.ctx.player.pause();
+      return;
+    }
+    await this.goto(String(next.songId));
+  }
+
+  /** 自然播完只等待服务端推进时间线，不替所有人发“切歌”操作。 */
+  onTrackEnded(): void {
+    if (!this.inRoom) return;
+    this.endedSongId = this.currentSongId;
+    this.endedFastPolls = 5;
+    this.scheduleHeartbeat(0);
+  }
+
+  async onLocalTrackChange(songId: string): Promise<void> {
+    const id = String(songId);
+    if (!this.running || !this.roomId || this.currentSongId === id) return;
+    try {
+      await this.pushSong(id);
+      await this.goto(id, false);
+    } catch (error) {
+      this.ctx.log.warn(
+        "[多人一起听] 同步本地切歌失败：",
+        error instanceof Error ? error.message : error,
+      );
     }
   }
 
-  /* ---------- 心跳 ---------- */
-
-  private scheduleHeartbeat(): void {
-    if (!this.running) return;
-    const delay = this.paused ? HEARTBEAT_PAUSED_MS : HEARTBEAT_PLAYING_MS;
-    this.heartbeatHandle = this.timers.setTimeout(() => void this.beat(), delay);
+  consumePendingPlayback(
+    songId: string,
+  ): { position: number; playing: boolean } | null {
+    if (!this.pendingPlayback || this.pendingPlayback.songId !== String(songId))
+      return null;
+    const pending = this.pendingPlayback;
+    this.pendingPlayback = null;
+    return {
+      position: pending.position + Math.max(0, this.timers.now() - pending.at),
+      playing: pending.playing,
+    };
   }
 
-  private async beat(): Promise<void> {
+  private startRoom(
+    roomId: string,
+    inviterId: string,
+    selfUserId: string,
+    snapshot?: MultiRoomSnapshot,
+  ): void {
+    this.roomId = roomId;
+    this.inviterId = inviterId;
+    this.selfUserId = selfUserId;
+    this.pinCounts.clear();
+    this.historyCheckedAt = Number.NEGATIVE_INFINITY;
+    this.memberCount = Math.max(
+      1,
+      Number(snapshot?.multiLtRoomUserAgg?.onlineNums ?? 1),
+      snapshot?.multiLtRoomUserAgg?.onlineUserInfos?.length ?? 0,
+    );
+    this.members = (snapshot?.multiLtRoomUserAgg?.onlineUserInfos ?? [])
+      .filter((user) => user.uid !== undefined || user.userId !== undefined)
+      .map((user) => ({
+        userId: String(user.uid ?? user.userId),
+        nickname: user.nickname || `用户 ${user.uid ?? user.userId}`,
+        avatarUrl: user.avatar ?? user.avatarUrl,
+      }));
+    this.running = true;
+    this.paused = false;
+    this.version = -1;
+    this.backoff = 1;
+    this.heartbeatMs = DEFAULT_HEARTBEAT_MS;
+    this.endedSongId = null;
+    this.endedFastPolls = 0;
+  }
+
+  private async resumeExistingRoom(selfUserId: string, expectedRoomId?: string): Promise<boolean> {
+    let snapshot: MultiRoomSnapshot | undefined;
     try {
-      if (this.roomId && this.currentSongId) {
-        const pos = await this.ctx.player.getPosition();
-        await this.api.heartbeat(
-          this.roomId,
-          this.currentSongId,
-          this.paused ? "PAUSE" : "PLAY",
-          Math.max(0, Math.round(pos)),
+      snapshot = (await this.api.roomStatus()).multiLtRoomSnapshot;
+    } catch (error) {
+      this.ctx.log.warn(
+        "[多人一起听] 查询已有房间失败：",
+        error instanceof Error ? error.message : error,
+      );
+      return false;
+    }
+    const roomId = snapshot?.roomId ?? snapshot?.multiRoomInfoDTO?.roomId;
+    if (!roomId || (expectedRoomId && String(roomId) !== String(expectedRoomId))) return false;
+    this.startRoom(String(roomId), selfUserId, selfUserId, snapshot);
+    if (snapshot?.roomPlaySongInfo) {
+      await this.applyRoomSongInfo(snapshot.roomPlaySongInfo, 0, true);
+    }
+    await this.runHeartbeat();
+    this.ctx.log.info(`[多人一起听] 已恢复房间 ${roomId}`);
+    return this.inRoom;
+  }
+
+  private assertRoomAccepted(
+    data: {
+      success?: boolean;
+      failedMessage?: string;
+      message?: string;
+      failedType?: string;
+      existRoomId?: string;
+      multiLtRoomSnapshot?: MultiRoomSnapshot;
+    },
+    action: string,
+  ): void {
+    if (data.success !== false && data.multiLtRoomSnapshot) return;
+    const message = data.failedMessage || data.message || data.failedType;
+    const existing = data.existRoomId ? `（已有房间 ${data.existRoomId}）` : "";
+    throw new Error(
+      `${action}多人房间失败${message ? `：${message}` : ""}${existing}`,
+    );
+  }
+
+  private scheduleHeartbeat(delay = this.heartbeatMs): void {
+    if (!this.running) return;
+    if (this.heartbeatHandle) this.timers.clearTimeout(this.heartbeatHandle);
+    this.heartbeatHandle = this.timers.setTimeout(
+      () => void this.runHeartbeat(),
+      delay,
+    );
+  }
+
+  private async runHeartbeat(reschedule = true): Promise<void> {
+    if (!this.running || !this.roomId) return;
+    const roomId = this.roomId;
+    const startedAt = this.timers.now();
+    try {
+      const data = await this.api.heartbeat(roomId);
+      if (!this.running || this.roomId !== roomId) return;
+      const endedAt = this.timers.now();
+      if (data.roomInfoDTO?.roomClosed) {
+        this.resetRoom();
+        this.ctx.log.warn("[多人一起听] 房间已结束");
+        return;
+      }
+      this.heartbeatMs = nextHeartbeatDelay(data.heartBeatDuration);
+      this.backoff = 1;
+      if (data.roomPlaySongInfo) {
+        await this.applyRoomSongInfo(
+          data.roomPlaySongInfo,
+          Math.max(0, (endedAt - startedAt) / 2),
+          false,
         );
       }
-    } catch (err) {
-      this.ctx.log.warn("[一起听] 心跳失败：", err instanceof Error ? err.message : err);
-    } finally {
-      this.scheduleHeartbeat();
-    }
-  }
-
-  /* ---------- 本地采样（检测用户拖动） ---------- */
-
-  private scheduleSample(): void {
-    if (!this.running) return;
-    this.sampleHandle = this.timers.setTimeout(() => void this.sample(), LOCAL_SAMPLE_MS);
-  }
-
-  private async sample(): Promise<void> {
-    try {
-      if (this.roomId && this.currentSongId) {
-        const pos = await this.ctx.player.getPosition();
-        this.observeLocalPosition(pos, this.timers.now());
+      try {
+        const status = await this.api.roomStatus();
+        if (this.running && this.roomId === roomId) {
+          const snapshot = status.multiLtRoomSnapshot;
+          const statusRoomId = snapshot?.roomId ?? snapshot?.multiRoomInfoDTO?.roomId;
+          if (snapshot?.multiLtRoomUserAgg && (!statusRoomId || statusRoomId === roomId)) {
+            const users = snapshot.multiLtRoomUserAgg.onlineUserInfos ?? [];
+            this.memberCount = Math.max(1, Number(snapshot.multiLtRoomUserAgg.onlineNums ?? users.length), users.length);
+            this.members = users.filter((user) => user.uid !== undefined || user.userId !== undefined).map((user) => ({
+              userId: String(user.uid ?? user.userId),
+              nickname: user.nickname || `用户 ${user.uid ?? user.userId}`,
+              avatarUrl: user.avatar ?? user.avatarUrl,
+            }));
+          }
+        }
+      } catch {
+        // 成员查询失败不影响房间时间线与下一次心跳。
       }
-    } catch {
-      /* 忽略采样失败 */
+      await this.refreshPinCounts();
+    } catch (error) {
+      if (error instanceof NeteaseApiError && error.code === "488") {
+        this.resetRoom();
+        this.ctx.log.warn("[多人一起听] 房间已失效，请重新创建或加入");
+        return;
+      }
+      this.backoff = isRateLimited(error)
+        ? Math.min(MAX_BACKOFF, this.backoff * 1.7)
+        : this.backoff;
+      this.ctx.log.warn(
+        "[多人一起听] 心跳失败，将自动重试：",
+        error instanceof Error ? error.message : error,
+      );
     } finally {
-      this.scheduleSample();
+      if (reschedule && this.running) {
+        if (this.endedSongId === this.currentSongId && this.endedFastPolls > 0) {
+          this.endedFastPolls -= 1;
+          this.scheduleHeartbeat(2_000);
+        } else {
+          this.scheduleHeartbeat(nextHeartbeatDelay(this.heartbeatMs / 1000, this.backoff));
+        }
+      }
     }
   }
 
-  /* ---------- 队列：推歌 / 置顶 ---------- */
-
-  /** 推歌：把歌曲加入房间展示列表（已存在则忽略） */
-  async pushSong(songId: string): Promise<void> {
-    if (!this.roomId) throw new Error("尚未加入房间");
-    const id = String(songId);
-    if (this.playlist.includes(id)) return;
-    const version = bumpVersion(this.versions, this.selfUserId);
-    await this.api.reportList(this.roomId, {
-      commandType: "ADD",
-      version,
-      anchorSongId: this.currentSongId ?? "",
-      anchorPosition: this.playlist.length,
-      randomList: [id],
-      displayList: [id],
-    });
-    this.ctx.log.info(`[一起听] 已推歌 ${id}`);
+  private async applyRoomSongInfo(
+    info: MultiRoomSongInfo,
+    halfRttMs: number,
+    force: boolean,
+  ): Promise<void> {
+    if (!this.updateRoomQueue(info, force)) return;
+    const playSong = info.playSong;
+    if (playSong?.songId === undefined) return;
+    const targetId = String(playSong.songId);
+    const expected = expectedMultiPosition(info.playedTime, halfRttMs);
+    if (targetId !== this.currentSongId) {
+      this.endedSongId = null;
+      this.endedFastPolls = 0;
+      this.recordPlayed(targetId);
+      this.currentSongId = targetId;
+      this.paused = false;
+      this.pendingPlayback = {
+        songId: targetId,
+        position: expected,
+        playing: true,
+        at: this.timers.now(),
+      };
+      await this.loadTrack(targetId);
+      return;
+    }
+    if (this.pendingPlayback?.songId === targetId) {
+      // 新曲仍在加载时，只更新待应用的服务端进度，避免 seek 到上一首。
+      this.pendingPlayback.position = expected;
+      this.pendingPlayback.at = this.timers.now();
+      return;
+    }
+    if (this.paused && !force) return;
+    const localPosition = await this.ctx.player.getPosition();
+    if (force || info.forceSync || needsSeek(localPosition, expected)) {
+      this.ctx.player.seek(Math.round(expected));
+    }
   }
 
-  /** 置顶：把歌曲移到展示列表最前（以 REPLACE 重排；需真机验证网易云是否接受） */
-  async pinSong(songId: string): Promise<void> {
-    if (!this.roomId) throw new Error("尚未加入房间");
-    const id = String(songId);
-    const reordered = [id, ...this.playlist.filter((s) => s !== id)];
-    const version = bumpVersion(this.versions, this.selfUserId);
-    await this.api.reportList(this.roomId, {
-      commandType: "REPLACE",
-      version,
-      anchorSongId: id,
-      anchorPosition: 0,
-      randomList: reordered,
-      displayList: reordered,
-    });
-    this.ctx.log.info(`[一起听] 已置顶 ${id}`);
+  /** 推歌和置顶只更新队列，不能把操作响应误当成切歌指令。 */
+  private updateRoomQueue(info: MultiRoomSongInfo, force: boolean): boolean {
+    const incomingVersion = Number(info.version ?? this.version);
+    if (!force && incomingVersion >= 0 && incomingVersion < this.version)
+      return false;
+    if (incomingVersion >= 0) this.version = incomingVersion;
+    const songs = [info.playSong, ...(info.nextSongs ?? [])].filter(
+      (song): song is MultiSongInfo => song?.songId !== undefined,
+    );
+    if (songs.length) this.playlist = songs;
+    return true;
   }
 
-  /** 切到指定歌曲（本地立即播放 + 上报 GOTO） */
-  async goto(songId: string): Promise<void> {
-    if (!this.roomId) throw new Error("尚未加入房间");
-    const id = String(songId);
-    const now = this.timers.now();
-    this.currentSongId = id;
-    this.overrideUntil = now + LOCAL_OVERRIDE_MS;
-    this.lastAppliedSeq = this.lastAppliedSeq + 1;
-    this.lastApplied = { progress: 0, playing: true, at: now };
-    await this.loadTrack(id, true);
-    await this.api.reportPlay(this.roomId, {
-      commandType: "GOTO",
-      progress: 0,
-      playStatus: "PLAY",
-      formerSongId: this.currentSongId,
-      targetSongId: id,
-      clientSeq: this.lastAppliedSeq,
-    });
+  private async loadTrack(songId: string): Promise<void> {
+    try {
+      const [song] = await this.api.songDetail([songId]);
+      if (!song) throw new Error("网易云未返回歌曲信息");
+      if (!this.running || this.currentSongId !== songId) return;
+      this.ctx.player.playTrack(toTogetherTrack(song));
+    } catch (error) {
+      this.ctx.log.error(
+        "[多人一起听] 加载歌曲失败：",
+        error instanceof Error ? error.message : error,
+      );
+    }
   }
 
-  /* ---------- 工具 ---------- */
+  /** 推荐消息以 songBizId 对应待播实例；同一首歌重复推荐也不会混淆次数。 */
+  private async refreshPinCounts(): Promise<void> {
+    if (!this.roomId || !this.running) return;
+    if (this.historyLoading) return this.historyLoading;
+    if (this.timers.now() - this.historyCheckedAt < 10_000) return;
+    const roomId = this.roomId;
+    this.historyCheckedAt = this.timers.now();
+    this.historyLoading = (async () => {
+      try {
+        const history = await this.api.roomHistory(roomId);
+        if (!this.running || this.roomId !== roomId) return;
+        const records = [...(history.records ?? [])].sort(
+          (a, b) => Number(a.sendTime ?? 0) - Number(b.sendTime ?? 0),
+        );
+        for (const record of records) {
+          const resource = record.resourceInfo;
+          if (resource?.bizId === undefined || resource.upCnt === undefined) continue;
+          const count = Number(resource.upCnt);
+          if (Number.isSafeInteger(count) && count >= 0) {
+            this.pinCounts.set(String(resource.bizId), count);
+          }
+        }
+      } catch (error) {
+        this.ctx.log.warn(
+          "[多人一起听] 读取置顶次数失败：",
+          error instanceof Error ? error.message : error,
+        );
+      } finally {
+        this.historyLoading = null;
+      }
+    })();
+    return this.historyLoading;
+  }
+
+  private findSong(songId: string): MultiSongInfo | undefined {
+    return this.playlist.find((song) => String(song.songId) === String(songId));
+  }
+
+  private recordPlayed(nextSongId: string): void {
+    if (this.currentSongId && this.currentSongId !== nextSongId) {
+      this.playedSongs.unshift(this.currentSongId);
+      this.playedSongs = this.playedSongs.slice(0, 30);
+    }
+  }
+
+  private requireRoom(): string {
+    if (!this.running || !this.roomId)
+      throw new Error("请先加入多人一起听房间");
+    return this.roomId;
+  }
 
   private async resolveSelfUserId(): Promise<string> {
     try {
-      const body = await this.ctx.callNetease<{ profile?: { userId?: number | string } }>("user_account", {});
-      return String(body.body?.profile?.userId ?? "");
+      const response = await this.ctx.callNetease<{
+        profile?: { userId?: string | number };
+      }>("user_account", {});
+      const userId = response.body?.profile?.userId;
+      if (response.status !== 200 || !userId) throw new Error("未登录");
+      return String(userId);
     } catch {
-      return "";
+      throw new Error("请先在 SPlayer-Next 登录网易云账号");
     }
   }
 
-  private clearTimers(): void {
-    for (const handle of [this.pollHandle, this.heartbeatHandle, this.sampleHandle, this.reportHandle]) {
-      if (handle) this.timers.clearTimeout(handle);
-    }
-    this.pollHandle = this.heartbeatHandle = this.sampleHandle = this.reportHandle = null;
-  }
-
-  /** 应用待处理的定位（供 index.ts 在曲目就绪后调用） */
-  consumePendingSeek(songId: string): number | null {
-    if (this.pendingSeek && this.pendingSeek.songId === songId) {
-      const position = this.pendingSeek.position;
-      this.pendingSeek = null;
-      return position;
-    }
-    return null;
+  private resetRoom(): void {
+    this.running = false;
+    if (this.heartbeatHandle) this.timers.clearTimeout(this.heartbeatHandle);
+    this.heartbeatHandle = null;
+    this.roomId = null;
+    this.inviterId = null;
+    this.selfUserId = "";
+    this.currentSongId = null;
+    this.playlist = [];
+    this.songCache.clear();
+    this.pinCounts.clear();
+    this.historyCheckedAt = Number.NEGATIVE_INFINITY;
+    this.playedSongs = [];
+    this.memberCount = 1;
+    this.members = [];
+    this.paused = false;
+    this.version = -1;
+    this.pendingPlayback = null;
+    this.endedSongId = null;
+    this.endedFastPolls = 0;
   }
 }
-
-export type { PlayStatus };

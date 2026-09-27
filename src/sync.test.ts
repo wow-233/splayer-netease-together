@@ -1,116 +1,214 @@
-/**
- * sync.test.ts — 同步引擎纯决策函数单测
- *
- * 覆盖：版本递增、云端指令仲裁、期望位置外推（含半 RTT）、漂移阈值、
- * 自适应退避延迟、房间链接解析、展示列表归一化。
- */
-
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import {
-  bumpVersion,
-  computeExpectedPosition,
-  displaySongIds,
+  buildMultiShareLink,
+  expectedMultiPosition,
   needsSeek,
-  nextPollDelay,
+  nextHeartbeatDelay,
   parseRoomLink,
-  shouldApplyCloud,
+  roomSongIds,
+  TogetherSyncEngine,
 } from "./sync";
+import type { SplayerContext, TogetherTrack } from "./types";
 
-test("bumpVersion：递增发送方自己的版本号", () => {
-  const next = bumpVersion([{ userId: "1", version: 3 }, { userId: "2", version: 5 }], "1");
-  assert.deepEqual(next, [{ userId: "1", version: 4 }, { userId: "2", version: 5 }]);
-});
-
-test("bumpVersion：首次参与新增 version=1，且不修改入参", () => {
-  const input = [{ userId: "2", version: 5 }];
-  const next = bumpVersion(input, "9");
-  assert.deepEqual(next, [{ userId: "2", version: 5 }, { userId: "9", version: 1 }]);
-  assert.deepEqual(input, [{ userId: "2", version: 5 }], "入参不应被修改");
-});
-
-test("shouldApplyCloud：更大的 clientSeq 胜出", () => {
-  assert.equal(
-    shouldApplyCloud({ cloudSeq: 10, lastAppliedSeq: 9, now: 1000, overrideUntil: 0 }),
-    true,
+test("解析官方多人邀请链接", () => {
+  assert.deepEqual(
+    parseRoomLink(
+      "https://st.music.163.com/listen-together/multishare/index.html?roomId=room_1&inviterUid=88&songId=123",
+    ),
+    { roomId: "room_1", inviterId: "88", songId: "123", isMultiRoom: true },
   );
 });
 
-test("shouldApplyCloud：本地乐观覆盖窗口内，未前进的云端指令被忽略", () => {
-  assert.equal(
-    shouldApplyCloud({ cloudSeq: 9, lastAppliedSeq: 9, now: 1000, overrideUntil: 2000 }),
-    false,
-  );
-});
-
-test("shouldApplyCloud：窗口外且 seq 未前进则不应用", () => {
-  assert.equal(
-    shouldApplyCloud({ cloudSeq: 9, lastAppliedSeq: 9, now: 3000, overrideUntil: 2000 }),
-    false,
-  );
-});
-
-test("computeExpectedPosition：播放中外推并叠加半 RTT", () => {
-  const pos = computeExpectedPosition({
-    command: { progress: 1000, playStatus: "PLAY" },
-    appliedAt: 1000,
-    now: 3000,
-    halfRttMs: 200,
+test("解析手机分享的完整文案和转义链接", () => {
+  const text = "大家围坐听歌，就等你啦！快点开看看 [https://st.music.163.com/listen-together/multishare/index.html?roomId=abc\\_123&inviterUid=88](https://st.music.163.com/listen-together/multishare/index.html?roomId=abc_123\\&inviterUid=88) (@网易云音乐)";
+  assert.deepEqual(parseRoomLink(text), {
+    roomId: "abc_123",
+    inviterId: "88",
+    isMultiRoom: true,
   });
-  assert.equal(pos, 1000 + 2000 + 200);
 });
 
-test("computeExpectedPosition：暂停时不外推", () => {
-  const pos = computeExpectedPosition({
-    command: { progress: 1000, playStatus: "PAUSE" },
-    appliedAt: 1000,
-    now: 3000,
-    halfRttMs: 200,
-  });
-  assert.equal(pos, 1000);
+test("创建时优先恢复账号已有的官方房间", async () => {
+  const calls: string[] = [];
+  const roomSong = { playSong: { songId: "123", songBizId: "9001" }, nextSongs: [], playedTime: 1000, version: 1 };
+  const ctx = {
+    callNetease: async (name: string) => {
+      calls.push(name);
+      if (name === "user_account") return { status: 200, body: { profile: { userId: 88 } } };
+      if (name === "listentogether_multi_match_status_get") return { status: 200, body: { code: 200, data: { multiLtRoomSnapshot: { roomId: "existing", roomPlaySongInfo: roomSong } } } };
+      if (name === "listentogether_multi_heartbeat") return { status: 200, body: { code: 200, data: { roomPlaySongInfo: roomSong, heartBeatDuration: 20 } } };
+      if (name === "song_detail") return { status: 200, body: { code: 200, songs: [{ id: 123, name: "原房间歌曲", ar: [{ name: "歌手" }], dt: 180000 }] } };
+      if (name === "listentogether_multi_match_msg_history") return { status: 200, body: { code: 200, data: { records: [] } } };
+      throw new Error(`unexpected API: ${name}`);
+    },
+    player: { getPosition: async () => 1000, playTrack: () => {}, seek: () => {} },
+    log: { info: () => {}, warn: () => {}, error: () => {} },
+  } as unknown as SplayerContext;
+  const engine = new TogetherSyncEngine({ ctx, timers: { setTimeout: () => 1, clearTimeout: () => {}, now: () => 1000 } });
+  const result = await engine.create();
+  assert.deepEqual(result, { roomId: "existing", creatorId: "88", resumed: true });
+  assert.equal(engine.snapshot.currentSongId, "123");
+  assert.ok(!calls.includes("listentogether_multi_room_create"));
+  assert.ok(!calls.includes("listentogether_security_token"));
 });
 
-test("needsSeek：超过 2s 阈值才需要定位", () => {
-  assert.equal(needsSeek(1000, 3000), false, "差值等于阈值不 seek");
-  assert.equal(needsSeek(1000, 3001), true);
+test("手机房间加入携带校验 token 并刷新实时成员", async () => {
+  const joined: Record<string, unknown>[] = [];
+  const roomSong = { playSong: { songId: "1", songBizId: "a" }, playedTime: 5_000, nextSongs: [{ songId: "2", songBizId: "b" }], version: 1 };
+  const ctx = {
+    callNetease: async (name: string, params: Record<string, unknown> = {}) => {
+      if (name === "user_account") return { status: 200, body: { profile: { userId: 9 } } };
+      if (name === "listentogether_security_token") return { status: 200, body: { code: 200, token: "test-token" } };
+      if (name === "listentogether_multi_match_ack") {
+        joined.push(params);
+        return { status: 200, body: { code: 200, data: { success: true, multiLtRoomSnapshot: { roomId: "abc_123", roomPlaySongInfo: roomSong } } } };
+      }
+      if (name === "listentogether_multi_heartbeat") return { status: 200, body: { code: 200, data: { roomPlaySongInfo: roomSong, heartBeatDuration: 20 } } };
+      if (name === "listentogether_multi_match_status_get") return { status: 200, body: { code: 200, data: { multiLtRoomSnapshot: { roomId: "abc_123", multiLtRoomUserAgg: { onlineNums: 2, onlineUserInfos: [{ uid: 9, nickname: "我", avatar: "me.png" }, { uid: 88, nickname: "好友", avatar: "friend.png" }] } } } } };
+      if (name === "listentogether_multi_match_msg_history") return { status: 200, body: { code: 200, data: { records: [{ sendTime: 1, resourceInfo: { bizId: "b", upCnt: 3 } }] } } };
+      if (name === "song_detail") return { status: 200, body: { code: 200, songs: [{ id: "1", name: "歌曲", ar: [{ name: "歌手" }], dt: 180000 }] } };
+      throw new Error(`unexpected API: ${name}`);
+    },
+    player: { getPosition: async () => 5_000, playTrack: () => {}, seek: () => {}, play: () => {} },
+    log: { info: () => {}, warn: () => {}, error: () => {} },
+  } as unknown as SplayerContext;
+  const engine = new TogetherSyncEngine({ ctx, timers: { setTimeout: () => 1, clearTimeout: () => {}, now: () => 1000 } });
+  await engine.join("大家围坐听歌 [https://st.music.163.com/listen-together/multishare/index.html?roomId=abc_123&inviterUid=88]");
+  assert.equal(joined[0]?.securityToken, "test-token");
+  assert.equal(engine.snapshot.memberCount, 2);
+  assert.equal(engine.snapshot.members[1]?.nickname, "好友");
+  assert.equal(engine.snapshot.members[1]?.avatarUrl, "friend.png");
+  assert.equal(engine.snapshot.queue[1]?.pinCount, 3);
+  assert.equal(engine.snapshot.queue[0]?.pinCount, undefined);
 });
 
-test("nextPollDelay：播放中基础 1.5s，暂停 5s，未在房间 10s", () => {
-  assert.equal(nextPollDelay({ inRoom: true, paused: false, backoff: 1, jitter: 1 }), 1500);
-  assert.equal(nextPollDelay({ inRoom: true, paused: true, backoff: 1, jitter: 1 }), 5000);
-  assert.equal(nextPollDelay({ inRoom: false, paused: false, backoff: 1, jitter: 1 }), 10000);
-});
-
-test("nextPollDelay：退避放大且封顶 30s", () => {
-  assert.equal(nextPollDelay({ inRoom: true, paused: false, backoff: 4, jitter: 1 }), 6000);
-  assert.equal(nextPollDelay({ inRoom: true, paused: false, backoff: 100, jitter: 1 }), 30000);
-});
-
-test("parseRoomLink：从分享链接解析 roomId / inviterId / songId", () => {
+test("双人耳机分享链接不会被识别为多人房间", () => {
   const parsed = parseRoomLink(
-    "https://st.music.163.com/listen-together/share/?songId=123&roomId=456&inviterId=789",
+    "https://st.music.163.com/listen-together/share/index.html?roomId=room_1&inviterId=88",
   );
-  assert.deepEqual(parsed, { roomId: "456", inviterId: "789", songId: "123" });
+  assert.equal(parsed.isMultiRoom, false);
+  assert.equal(parsed.roomId, "room_1");
 });
 
-test("parseRoomLink：非法/空输入返回空对象", () => {
-  assert.deepEqual(parseRoomLink(""), {});
-  assert.deepEqual(parseRoomLink("not-a-link"), {});
+test("非法或空链接返回非多人房间", () => {
+  assert.deepEqual(parseRoomLink(""), { isMultiRoom: false });
+  assert.deepEqual(parseRoomLink("not-a-link"), { isMultiRoom: false });
 });
 
-test("parseRoomLink：兼容 multishare 链接的 inviterUid", () => {
-  const parsed = parseRoomLink(
-    "https://st.music.163.com/listen-together/multishare/index.html?roomId=261457dc16edd2d823ce56e6965d7f70_1789174659929&inviterUid=17932835450",
+test("生成手机端可打开的官方多人邀请链接", () => {
+  assert.equal(
+    buildMultiShareLink("room_1", "88", "123"),
+    "https://st.music.163.com/listen-together/multishare/index.html?roomId=room_1&inviterUid=88&songId=123",
   );
-  assert.deepEqual(parsed, {
-    roomId: "261457dc16edd2d823ce56e6965d7f70_1789174659929",
-    inviterId: "17932835450",
-  });
 });
 
-test("displaySongIds：兼容对象与原始值两种展示项", () => {
-  const ids = displaySongIds({
-    playlist: { displayList: { result: [{ songId: 1 }, 2, { songId: "3" }] } },
+test("服务端心跳秒数换算为毫秒并限制范围", () => {
+  assert.equal(nextHeartbeatDelay(5), 5_000);
+  assert.equal(nextHeartbeatDelay(0), 20_000);
+  assert.equal(nextHeartbeatDelay(1), 2_000);
+  assert.equal(nextHeartbeatDelay(20, 2), 30_000);
+});
+
+test("播放进度补偿半个请求往返时间", () => {
+  assert.equal(expectedMultiPosition(12_000, 250), 12_250);
+  assert.equal(expectedMultiPosition(undefined, -10), 0);
+});
+
+test("进度差超过两秒才定位", () => {
+  assert.equal(needsSeek(1_000, 3_000), false);
+  assert.equal(needsSeek(1_000, 3_001), true);
+});
+
+test("提取当前歌曲和后续队列", () => {
+  assert.deepEqual(
+    roomSongIds({
+      playSong: { songId: 1, songBizId: "a" },
+      nextSongs: [{ songId: "2" }, { songId: 3 }],
+    }),
+    ["1", "2", "3"],
+  );
+});
+
+test("推歌和切歌响应仍是旧队列时，播放器和房间视图使用目标歌曲", async () => {
+  const played: TogetherTrack[] = [];
+  const operations: unknown[] = [];
+  const currentSong = { songId: "1", songBizId: "a" };
+  const ctx = {
+    callNetease: async (name: string, params?: Record<string, unknown>) => {
+      if (name === "user_account") return { status: 200, body: { profile: { userId: 9 } } };
+      if (name === "listentogether_security_token") return { status: 200, body: { code: 200, token: "test-token" } };
+      if (name === "listentogether_multi_room_create") {
+        return {
+          status: 200,
+          body: {
+            code: 200,
+            data: {
+              success: true,
+              multiLtRoomSnapshot: {
+                roomId: "room",
+                roomPlaySongInfo: {
+                  playSong: currentSong,
+                  nextSongs: [],
+                  version: 1,
+                },
+              },
+            },
+          },
+        };
+      }
+      if (name === "listentogether_multi_song_operate") {
+        assert.equal(params?.songId, "2");
+        operations.push(params?.operate);
+        return {
+          status: 200,
+          body: {
+            code: 200,
+            data: {
+              operateSongId: "2",
+              operateSongBizId: "b",
+              roomSongInfo: { playSong: currentSong, nextSongs: [], version: 1 },
+            },
+          },
+        };
+      }
+      if (name === "song_detail") {
+        return {
+          status: 200,
+          body: {
+            code: 200,
+            songs: String(params?.ids).split(",").map((id) => ({
+              id,
+              name: `歌曲 ${id}`,
+              ar: [{ name: "歌手" }],
+              dt: 180000,
+            })),
+          },
+        };
+      }
+      throw new Error(`unexpected API: ${name}`);
+    },
+    player: {
+      getPosition: async () => 0,
+      playTrack: (track: TogetherTrack) => played.push(track),
+      play: () => {},
+      seek: () => {},
+    },
+    log: { info: () => {}, warn: () => {}, error: () => {} },
+  } as unknown as SplayerContext;
+  const engine = new TogetherSyncEngine({
+    ctx,
+    timers: { setTimeout: () => 1, clearTimeout: () => {}, now: () => 1000 },
   });
-  assert.deepEqual(ids, ["1", "2", "3"]);
+  await engine.create({ id: "1", source: "netease", title: "歌曲 1", artists: [], duration: 180000 });
+  engine.onTrackEnded();
+  assert.deepEqual(operations, [], "自然播完不能发官方切歌请求");
+  await engine.goto("2");
+  assert.equal(engine.snapshot.currentSongId, "2");
+  assert.deepEqual(operations, [1, 4]);
+  assert.deepEqual(engine.snapshot.queue.map((song) => song.songId), ["2", "1"]);
+  assert.equal(engine.snapshot.played[0]?.songId, "1");
+  assert.equal(played[0]?.id, "2");
+  const detail = await engine.detailedSnapshot();
+  assert.equal(detail.queue[0]?.track?.title, "歌曲 2");
 });
