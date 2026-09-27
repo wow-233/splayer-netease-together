@@ -4,12 +4,21 @@ SPlayer-Next 的「网易云多人一起听」控制插件：让 Windows 桌面�
 
 房间使用网易云官方 `multi` 协议和 `multishare` 邀请链接，可以容纳多人。旧的“耳机分你一半”双人链接会被明确拒绝。
 
+## Windows 直接安装
+
+1. 打开 [v1.3.2 下载页](https://github.com/wow-233/splayer-netease-together/releases/tag/v1.3.2)，下载 Windows x64 安装包和 `netease-listen-together.js` 插件文件。
+2. 运行安装包，打开 SPlayer-Next 并登录网易云音乐。
+3. 在「设置 → 插件管理 → 本地导入」选择下载的插件文件，允许「网易云 / 控制 / 联网 / 界面」权限。
+4. 播放网易云在线歌曲，从侧边栏或播放器进入「多人一起听」，创建房间或粘贴手机端多人邀请链接。
+
+安装包由 GitHub Actions 从公开源码构建，不包含发布者的 `UserData` 或登录信息。此版本为体验版，双设备互通仍需实际验证。
+
 ## 组成
 
-| 部分                    | 位置                            | 说明                                                              |
-| ----------------------- | ------------------------------- | ----------------------------------------------------------------- |
+| 部分                    | 位置                                                                                                 | 说明                                                              |
+| ----------------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
 | 宿主扩展（Host Bridge） | [SPlayer-Next 一起听分支](https://github.com/wow-233/SPlayer-Next/tree/feat/netease-listen-together) | 给插件系统加 `player.playTrack`、`netease.call` 与 `netease` 权限 |
-| 插件（本目录）          | `splayer-netease-together/`     | 一起听协议 + 同步引擎 + 交互                                      |
+| 插件（本目录）          | `splayer-netease-together/`                                                                          | 一起听协议 + 同步引擎 + 交互                                      |
 
 ## 宿主扩展清单（已应用）
 
@@ -30,7 +39,7 @@ npm test           # 纯决策函数单测
 npm run smoke      # 用 node:vm 模拟沙箱加载真实产物
 ```
 
-## 安装
+## 从源码安装
 
 1. 先构建并运行已集成宿主扩展的 [SPlayer-Next 一起听分支](https://github.com/wow-233/SPlayer-Next/tree/feat/netease-listen-together)。
 2. 在 **设置 → 插件管理 → 本地导入** 选择 `dist/netease-listen-together.js`。
@@ -46,12 +55,12 @@ npm run smoke      # 用 node:vm 模拟沙箱加载真实产物
 
 ## 四个核心约束的实现
 
-| 约束          | 方案                                                                                                                                       | 位置                                                                   |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
-| 时钟同步/防抖 | 以多人心跳的 `roomPlaySongInfo.version` 防止旧状态覆盖，按 `playedTime + 半 RTT` 对齐，漂移超 2 秒才定位 | `sync.ts` `applyRoomSongInfo` / `expectedMultiPosition` / `needsSeek` |
-| 风控/频率限制 | 使用服务端下发的 `heartBeatDuration`，失败时自适应退避，间隔限制在 2 到 30 秒 | `sync.ts` `nextHeartbeatDelay` / `runHeartbeat` |
-| 桥接权限边界  | 沙箱全局 `splayer`（非 `window`）→ `hostCall` → `dispatchHostCall` 权限门控 → `callNetease`（自动注入登录 Cookie）                         | `host.ts` / `host.worker.ts` / `apis/netease/index.ts`                 |
-| 断线重连补偿  | 心跳恢复后按房间当前歌曲、队列版本和服务端进度重新对齐 | `sync.ts` `runHeartbeat` / `applyRoomSongInfo` |
+| 约束          | 方案                                                                                                               | 位置                                                                  |
+| ------------- | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
+| 时钟同步/防抖 | 以多人心跳的 `roomPlaySongInfo.version` 防止旧状态覆盖，按 `playedTime + 半 RTT` 对齐，漂移超 2 秒才定位           | `sync.ts` `applyRoomSongInfo` / `expectedMultiPosition` / `needsSeek` |
+| 风控/频率限制 | 使用服务端下发的 `heartBeatDuration`，失败时自适应退避，间隔限制在 2 到 30 秒                                      | `sync.ts` `nextHeartbeatDelay` / `runHeartbeat`                       |
+| 桥接权限边界  | 沙箱全局 `splayer`（非 `window`）→ `hostCall` → `dispatchHostCall` 权限门控 → `callNetease`（自动注入登录 Cookie） | `host.ts` / `host.worker.ts` / `apis/netease/index.ts`                |
+| 断线重连补偿  | 心跳恢复后按房间当前歌曲、队列版本和服务端进度重新对齐                                                             | `sync.ts` `runHeartbeat` / `applyRoomSongInfo`                        |
 
 ## 已知限制
 
