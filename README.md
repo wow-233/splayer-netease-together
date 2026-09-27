@@ -8,7 +8,7 @@ SPlayer-Next 的「网易云多人一起听」控制插件：让 Windows 桌面�
 
 | 部分                    | 位置                            | 说明                                                              |
 | ----------------------- | ------------------------------- | ----------------------------------------------------------------- |
-| 宿主扩展（Host Bridge） | `SPlayer-Next/`（本仓库的补丁） | 给插件系统加 `player.playTrack`、`netease.call` 与 `netease` 权限 |
+| 宿主扩展（Host Bridge） | [SPlayer-Next 一起听分支](https://github.com/wow-233/SPlayer-Next/tree/feat/netease-listen-together) | 给插件系统加 `player.playTrack`、`netease.call` 与 `netease` 权限 |
 | 插件（本目录）          | `splayer-netease-together/`     | 一起听协议 + 同步引擎 + 交互                                      |
 
 ## 宿主扩展清单（已应用）
@@ -32,7 +32,7 @@ npm run smoke      # 用 node:vm 模拟沙箱加载真实产物
 
 ## 安装
 
-1. 先应用上面的宿主扩展并重新构建 / 运行 SPlayer-Next。
+1. 先构建并运行已集成宿主扩展的 [SPlayer-Next 一起听分支](https://github.com/wow-233/SPlayer-Next/tree/feat/netease-listen-together)。
 2. 在 **设置 → 插件管理 → 本地导入** 选择 `dist/netease-listen-together.js`。
 3. 在插件卡片上确认已授予 `网易云 / 控制 / 联网 / 界面` 权限。
 
@@ -64,4 +64,4 @@ npm run smoke      # 用 node:vm 模拟沙箱加载真实产物
 
 ## 许可
 
-插件本体独立分发；宿主补丁遵循 SPlayer-Next 的 AGPL-3.0。
+插件本体独立分发；宿主改动遵循 SPlayer-Next 的 AGPL-3.0。
