@@ -357,6 +357,7 @@ test("推歌和切歌响应仍是旧队列时，播放器和房间视图使用�
 });
 
 test("置顶操作无需等待历史消息接口即可回显次数", async () => {
+  let resolveHistory: ((value: unknown) => void) | undefined;
   const ctx = {
     callNetease: async (name: string) => {
       if (name === "user_account")
@@ -386,7 +387,9 @@ test("置顶操作无需等待历史消息接口即可回显次数", async () =>
       if (name === "listentogether_multi_song_operate")
         return { status: 200, body: { code: 200, data: {} } };
       if (name === "listentogether_multi_match_msg_history")
-        return new Promise(() => {});
+        return new Promise((resolve) => {
+          resolveHistory = resolve;
+        });
       if (name === "song_detail")
         return {
           status: 200,
@@ -430,4 +433,17 @@ test("置顶操作无需等待历史消息接口即可回显次数", async () =>
     ),
   ]);
   assert.equal(detail.queue[0]?.pinCount, 1);
+  resolveHistory?.({
+    status: 200,
+    body: {
+      code: 200,
+      data: { records: [{ resourceInfo: { bizId: "biz-1", upCnt: 0 } }] },
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    engine.snapshot.queue[0]?.pinCount,
+    1,
+    "延迟的旧记录不能覆盖刚完成的置顶",
+  );
 });

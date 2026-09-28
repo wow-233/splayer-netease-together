@@ -115,6 +115,10 @@ export class TogetherSyncEngine {
   private playlist: MultiSongInfo[] = [];
   private readonly songCache = new Map<string, TogetherTrack>();
   private readonly pinCounts = new Map<string, number>();
+  private readonly pendingPinCounts = new Map<
+    string,
+    { count: number; until: number }
+  >();
   private historyCheckedAt = Number.NEGATIVE_INFINITY;
   private historyLoading: Promise<void> | null = null;
   private playedSongs: string[] = [];
@@ -374,7 +378,12 @@ export class TogetherSyncEngine {
     );
     if (data.roomSongInfo) this.updateRoomQueue(data.roomSongInfo, false);
     const bizId = String(song.songBizId);
-    this.pinCounts.set(bizId, (this.pinCounts.get(bizId) ?? 0) + 1);
+    const optimisticCount = (this.pinCounts.get(bizId) ?? 0) + 1;
+    this.pinCounts.set(bizId, optimisticCount);
+    this.pendingPinCounts.set(bizId, {
+      count: optimisticCount,
+      until: this.timers.now() + 10_000,
+    });
     this.historyCheckedAt = Number.NEGATIVE_INFINITY;
     void this.refreshPinCounts();
   }
@@ -477,6 +486,7 @@ export class TogetherSyncEngine {
     this.inviterId = inviterId;
     this.selfUserId = selfUserId;
     this.pinCounts.clear();
+    this.pendingPinCounts.clear();
     this.historyCheckedAt = Number.NEGATIVE_INFINITY;
     this.memberCount = Math.max(
       1,
@@ -725,7 +735,16 @@ export class TogetherSyncEngine {
             continue;
           const count = Number(resource.upCnt);
           if (Number.isSafeInteger(count) && count >= 0) {
-            this.pinCounts.set(String(resource.bizId), count);
+            const bizId = String(resource.bizId);
+            const pending = this.pendingPinCounts.get(bizId);
+            if (
+              pending &&
+              count < pending.count &&
+              this.timers.now() < pending.until
+            )
+              continue;
+            this.pendingPinCounts.delete(bizId);
+            this.pinCounts.set(bizId, count);
           }
         }
       } catch (error) {
@@ -781,6 +800,7 @@ export class TogetherSyncEngine {
     this.playlist = [];
     this.songCache.clear();
     this.pinCounts.clear();
+    this.pendingPinCounts.clear();
     this.historyCheckedAt = Number.NEGATIVE_INFINITY;
     this.playedSongs = [];
     this.memberCount = 1;

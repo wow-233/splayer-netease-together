@@ -214,6 +214,7 @@
     playlist = [];
     songCache = /* @__PURE__ */ new Map();
     pinCounts = /* @__PURE__ */ new Map();
+    pendingPinCounts = /* @__PURE__ */ new Map();
     historyCheckedAt = Number.NEGATIVE_INFINITY;
     historyLoading = null;
     playedSongs = [];
@@ -415,7 +416,12 @@
       );
       if (data.roomSongInfo) this.updateRoomQueue(data.roomSongInfo, false);
       const bizId = String(song.songBizId);
-      this.pinCounts.set(bizId, (this.pinCounts.get(bizId) ?? 0) + 1);
+      const optimisticCount = (this.pinCounts.get(bizId) ?? 0) + 1;
+      this.pinCounts.set(bizId, optimisticCount);
+      this.pendingPinCounts.set(bizId, {
+        count: optimisticCount,
+        until: this.timers.now() + 1e4
+      });
       this.historyCheckedAt = Number.NEGATIVE_INFINITY;
       void this.refreshPinCounts();
     }
@@ -504,6 +510,7 @@
       this.inviterId = inviterId;
       this.selfUserId = selfUserId;
       this.pinCounts.clear();
+      this.pendingPinCounts.clear();
       this.historyCheckedAt = Number.NEGATIVE_INFINITY;
       this.memberCount = Math.max(
         1,
@@ -707,7 +714,12 @@
               continue;
             const count = Number(resource.upCnt);
             if (Number.isSafeInteger(count) && count >= 0) {
-              this.pinCounts.set(String(resource.bizId), count);
+              const bizId = String(resource.bizId);
+              const pending = this.pendingPinCounts.get(bizId);
+              if (pending && count < pending.count && this.timers.now() < pending.until)
+                continue;
+              this.pendingPinCounts.delete(bizId);
+              this.pinCounts.set(bizId, count);
             }
           }
         } catch (error) {
@@ -756,6 +768,7 @@
       this.playlist = [];
       this.songCache.clear();
       this.pinCounts.clear();
+      this.pendingPinCounts.clear();
       this.historyCheckedAt = Number.NEGATIVE_INFINITY;
       this.playedSongs = [];
       this.memberCount = 1;
