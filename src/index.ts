@@ -195,14 +195,17 @@ ctx.on("menuClick", async ({ menuId, track, data }) => {
       if (engine.inRoom) return { error: "已在房间中，请先退出一起听" };
       try {
         const initialTrack = isNeteaseTrack(track) ? track : undefined;
-        const { roomId, creatorId, resumed } = await engine.create(initialTrack);
+        const { roomId, creatorId, resumed } =
+          await engine.create(initialTrack);
         const link = buildMultiShareLink(
           roomId,
           creatorId,
           initialTrack ? String(initialTrack.id) : undefined,
         );
         return {
-          toast: resumed ? "已恢复现有多人房间，邀请链接已复制" : "已创建多人一起听房间，邀请链接已复制",
+          toast: resumed
+            ? "已恢复现有多人房间，邀请链接已复制"
+            : "已创建多人一起听房间，邀请链接已复制",
           copyText: link,
           data: engine.snapshot,
         };
@@ -246,6 +249,7 @@ ctx.on("menuClick", async ({ menuId, track, data }) => {
       if (!engine.inRoom) return { error: "请先加入一起听" };
       if (!isNeteaseTrack(track)) return { error: "仅支持推网易云在线歌曲" };
       try {
+        engine.cacheTrack(track);
         await engine.pushSong(String(track.id));
         if (ctx.getSetting(SETTING_PIN_AFTER_PUSH))
           await engine.pinSong(String(track.id));

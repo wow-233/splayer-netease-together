@@ -35,7 +35,9 @@ export const parseRoomLink = (input: string): ParsedRoomLink => {
   try {
     // 手机分享可能是整段文案、Markdown 链接，且转发时会转义 _ 和 &。
     const candidate = text.match(/https?:\/\/[^\s<>\])]+/i)?.[0] ?? text;
-    const url = new URL(candidate.replace(/\\([_&?=])/g, "$1").replace(/[。，,;；]+$/, ""));
+    const url = new URL(
+      candidate.replace(/\\([_&?=])/g, "$1").replace(/[。，,;；]+$/, ""),
+    );
     const roomId = url.searchParams.get("roomId") || undefined;
     const inviterId =
       url.searchParams.get("inviterUid") ||
@@ -117,7 +119,11 @@ export class TogetherSyncEngine {
   private historyLoading: Promise<void> | null = null;
   private playedSongs: string[] = [];
   private memberCount = 1;
-  private members: Array<{ userId: string; nickname: string; avatarUrl?: string }> = [];
+  private members: Array<{
+    userId: string;
+    nickname: string;
+    avatarUrl?: string;
+  }> = [];
   private paused = false;
   private running = false;
   private version = -1;
@@ -166,7 +172,9 @@ export class TogetherSyncEngine {
       if (await this.resumeExistingRoom(selfUserId, data.existRoomId)) {
         return { roomId: this.roomId!, creatorId: selfUserId, resumed: true };
       }
-      throw new Error("网易云账号已在其他多人房间，请先在手机端退出该房间后再创建");
+      throw new Error(
+        "网易云账号已在其他多人房间，请先在手机端退出该房间后再创建",
+      );
     }
     this.assertRoomAccepted(data, "创建");
     const snapshot = data.multiLtRoomSnapshot;
@@ -206,7 +214,9 @@ export class TogetherSyncEngine {
     const data = await this.api.joinRoom(roomId, inviterId);
     if (data.failedType === "MULTI_ACK_ALREADY_IN_ROOM" || data.existRoomId) {
       if (data.existRoomId && String(data.existRoomId) !== String(roomId)) {
-        throw new Error("网易云账号仍在另一个多人房间，请先退出原房间后再加入邀请房间");
+        throw new Error(
+          "网易云账号仍在另一个多人房间，请先退出原房间后再加入邀请房间",
+        );
       }
       if (await this.resumeExistingRoom(selfUserId, roomId)) return;
       throw new Error("网易云账号已在其他多人房间，请先在手机端退出后再加入");
@@ -251,7 +261,12 @@ export class TogetherSyncEngine {
     memberCount: number;
     members: Array<{ userId: string; nickname: string; avatarUrl?: string }>;
     paused: boolean;
-    queue: Array<{ songId: string; track?: TogetherTrack; recommendedBy?: string; pinCount?: number }>;
+    queue: Array<{
+      songId: string;
+      track?: TogetherTrack;
+      recommendedBy?: string;
+      pinCount?: number;
+    }>;
     played: Array<{ songId: string; track?: TogetherTrack }>;
   } {
     return {
@@ -268,7 +283,10 @@ export class TogetherSyncEngine {
         songId: String(song.songId),
         track: this.songCache.get(String(song.songId)),
         recommendedBy: song.songRcmdUid ? String(song.songRcmdUid) : undefined,
-        pinCount: song.songBizId === undefined ? undefined : this.pinCounts.get(String(song.songBizId)),
+        pinCount:
+          song.songBizId === undefined
+            ? undefined
+            : this.pinCounts.get(String(song.songBizId)),
       })),
       played: this.playedSongs.map((songId) => ({
         songId,
@@ -278,9 +296,15 @@ export class TogetherSyncEngine {
   }
 
   async detailedSnapshot() {
-    if (this.inRoom) await this.refreshPinCounts();
-    const ids = [...this.playlist.map((song) => String(song.songId)), ...this.playedSongs];
-    const missing = [...new Set(ids)].filter((id) => !this.songCache.has(id)).slice(0, 50);
+    // 历史消息只用于补充置顶数，不应阻塞房间页面和每次操作的回显。
+    if (this.inRoom) void this.refreshPinCounts();
+    const ids = [
+      ...this.playlist.map((song) => String(song.songId)),
+      ...this.playedSongs,
+    ];
+    const missing = [...new Set(ids)]
+      .filter((id) => !this.songCache.has(id))
+      .slice(0, 50);
     if (missing.length) {
       try {
         for (const song of await this.api.songDetail(missing)) {
@@ -296,6 +320,10 @@ export class TogetherSyncEngine {
       }
     }
     return this.snapshot;
+  }
+
+  cacheTrack(track: TogetherTrack): void {
+    if (track.source === "netease") this.songCache.set(String(track.id), track);
   }
 
   onLocalEvent(
@@ -324,6 +352,7 @@ export class TogetherSyncEngine {
       });
     }
     this.ctx.log.info(`[多人一起听] 已推歌 ${id}`);
+    this.scheduleHeartbeat(1_500);
   }
 
   async pinSong(songId: string): Promise<void> {
@@ -344,8 +373,10 @@ export class TogetherSyncEngine {
       2,
     );
     if (data.roomSongInfo) this.updateRoomQueue(data.roomSongInfo, false);
+    const bizId = String(song.songBizId);
+    this.pinCounts.set(bizId, (this.pinCounts.get(bizId) ?? 0) + 1);
     this.historyCheckedAt = Number.NEGATIVE_INFINITY;
-    await this.refreshPinCounts();
+    void this.refreshPinCounts();
   }
 
   async goto(songId: string, loadLocally = true): Promise<void> {
@@ -369,7 +400,11 @@ export class TogetherSyncEngine {
     // 歌曲操作成功后，以请求的歌曲为目标；操作响应可能仍是切换前的快照。
     this.recordPlayed(id);
     const selected = this.findSong(id) ?? song;
-    if (selected) this.playlist = [selected, ...this.playlist.filter((song) => String(song.songId) !== id)];
+    if (selected)
+      this.playlist = [
+        selected,
+        ...this.playlist.filter((song) => String(song.songId) !== id),
+      ];
     this.currentSongId = id;
     this.paused = false;
     this.pendingPlayback = {
@@ -387,7 +422,9 @@ export class TogetherSyncEngine {
     const previousId = this.currentSongId;
     await this.runHeartbeat(false);
     if (!this.inRoom || this.currentSongId !== previousId) return;
-    const next = this.playlist.find((song) => String(song.songId) !== this.currentSongId);
+    const next = this.playlist.find(
+      (song) => String(song.songId) !== this.currentSongId,
+    );
     if (!next) {
       this.ctx.player.pause();
       return;
@@ -462,7 +499,10 @@ export class TogetherSyncEngine {
     this.endedFastPolls = 0;
   }
 
-  private async resumeExistingRoom(selfUserId: string, expectedRoomId?: string): Promise<boolean> {
+  private async resumeExistingRoom(
+    selfUserId: string,
+    expectedRoomId?: string,
+  ): Promise<boolean> {
     let snapshot: MultiRoomSnapshot | undefined;
     try {
       snapshot = (await this.api.roomStatus()).multiLtRoomSnapshot;
@@ -474,7 +514,11 @@ export class TogetherSyncEngine {
       return false;
     }
     const roomId = snapshot?.roomId ?? snapshot?.multiRoomInfoDTO?.roomId;
-    if (!roomId || (expectedRoomId && String(roomId) !== String(expectedRoomId))) return false;
+    if (
+      !roomId ||
+      (expectedRoomId && String(roomId) !== String(expectedRoomId))
+    )
+      return false;
     this.startRoom(String(roomId), selfUserId, selfUserId, snapshot);
     if (snapshot?.roomPlaySongInfo) {
       await this.applyRoomSongInfo(snapshot.roomPlaySongInfo, 0, true);
@@ -534,25 +578,8 @@ export class TogetherSyncEngine {
           false,
         );
       }
-      try {
-        const status = await this.api.roomStatus();
-        if (this.running && this.roomId === roomId) {
-          const snapshot = status.multiLtRoomSnapshot;
-          const statusRoomId = snapshot?.roomId ?? snapshot?.multiRoomInfoDTO?.roomId;
-          if (snapshot?.multiLtRoomUserAgg && (!statusRoomId || statusRoomId === roomId)) {
-            const users = snapshot.multiLtRoomUserAgg.onlineUserInfos ?? [];
-            this.memberCount = Math.max(1, Number(snapshot.multiLtRoomUserAgg.onlineNums ?? users.length), users.length);
-            this.members = users.filter((user) => user.uid !== undefined || user.userId !== undefined).map((user) => ({
-              userId: String(user.uid ?? user.userId),
-              nickname: user.nickname || `用户 ${user.uid ?? user.userId}`,
-              avatarUrl: user.avatar ?? user.avatarUrl,
-            }));
-          }
-        }
-      } catch {
-        // 成员查询失败不影响房间时间线与下一次心跳。
-      }
-      await this.refreshPinCounts();
+      // 成员和置顶数是附加信息，并行读取，避免互相拖慢下一次房间同步。
+      await Promise.all([this.refreshMembers(roomId), this.refreshPinCounts()]);
     } catch (error) {
       if (error instanceof NeteaseApiError && error.code === "488") {
         this.resetRoom();
@@ -568,13 +595,48 @@ export class TogetherSyncEngine {
       );
     } finally {
       if (reschedule && this.running) {
-        if (this.endedSongId === this.currentSongId && this.endedFastPolls > 0) {
+        if (
+          this.endedSongId === this.currentSongId &&
+          this.endedFastPolls > 0
+        ) {
           this.endedFastPolls -= 1;
           this.scheduleHeartbeat(2_000);
         } else {
-          this.scheduleHeartbeat(nextHeartbeatDelay(this.heartbeatMs / 1000, this.backoff));
+          this.scheduleHeartbeat(
+            nextHeartbeatDelay(this.heartbeatMs / 1000, this.backoff),
+          );
         }
       }
+    }
+  }
+
+  private async refreshMembers(roomId: string): Promise<void> {
+    try {
+      const status = await this.api.roomStatus();
+      if (!this.running || this.roomId !== roomId) return;
+      const snapshot = status.multiLtRoomSnapshot;
+      const statusRoomId =
+        snapshot?.roomId ?? snapshot?.multiRoomInfoDTO?.roomId;
+      if (
+        !snapshot?.multiLtRoomUserAgg ||
+        (statusRoomId && statusRoomId !== roomId)
+      )
+        return;
+      const users = snapshot.multiLtRoomUserAgg.onlineUserInfos ?? [];
+      this.memberCount = Math.max(
+        1,
+        Number(snapshot.multiLtRoomUserAgg.onlineNums ?? users.length),
+        users.length,
+      );
+      this.members = users
+        .filter((user) => user.uid !== undefined || user.userId !== undefined)
+        .map((user) => ({
+          userId: String(user.uid ?? user.userId),
+          nickname: user.nickname || `用户 ${user.uid ?? user.userId}`,
+          avatarUrl: user.avatar ?? user.avatarUrl,
+        }));
+    } catch {
+      // 成员查询失败不影响房间时间线与下一次心跳。
     }
   }
 
@@ -659,7 +721,8 @@ export class TogetherSyncEngine {
         );
         for (const record of records) {
           const resource = record.resourceInfo;
-          if (resource?.bizId === undefined || resource.upCnt === undefined) continue;
+          if (resource?.bizId === undefined || resource.upCnt === undefined)
+            continue;
           const count = Number(resource.upCnt);
           if (Number.isSafeInteger(count) && count >= 0) {
             this.pinCounts.set(String(resource.bizId), count);

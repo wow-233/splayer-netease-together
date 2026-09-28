@@ -6,7 +6,7 @@ SPlayer-Next 的「网易云多人一起听」控制插件：让 Windows 桌面�
 
 ## Windows 直接安装
 
-1. 打开 [v1.3.2 下载页](https://github.com/wow-233/splayer-netease-together/releases/tag/v1.3.2)，下载 Windows x64 安装包和 `netease-listen-together.js` 插件文件。
+1. 打开 [v1.3.3 下载页](https://github.com/wow-233/splayer-netease-together/releases/tag/v1.3.3)，下载 Windows x64 安装包和 `netease-listen-together.js` 插件文件。
 2. 运行安装包，打开 SPlayer-Next 并登录网易云音乐。
 3. 在「设置 → 插件管理 → 本地导入」选择下载的插件文件，允许「网易云 / 控制 / 联网 / 界面」权限。
 4. 播放网易云在线歌曲，从侧边栏或播放器进入「多人一起听」，创建房间或粘贴手机端多人邀请链接。

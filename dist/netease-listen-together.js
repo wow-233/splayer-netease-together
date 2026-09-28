@@ -1,7 +1,7 @@
 /**
  * @name        网易云多人一起听
  * @id          splayer.netease-together
- * @version     1.3.2
+ * @version     1.3.3
  * @description 使用网易云官方多人房间，与手机端和其他 SPlayer 同步播放、推歌与置顶
  * @author      Sisyphus
  * @type        control
@@ -170,7 +170,9 @@
     if (!text) return { isMultiRoom: false };
     try {
       const candidate = text.match(/https?:\/\/[^\s<>\])]+/i)?.[0] ?? text;
-      const url = new URL(candidate.replace(/\\([_&?=])/g, "$1").replace(/[。，,;；]+$/, ""));
+      const url = new URL(
+        candidate.replace(/\\([_&?=])/g, "$1").replace(/[。，,;；]+$/, "")
+      );
       const roomId = url.searchParams.get("roomId") || void 0;
       const inviterId = url.searchParams.get("inviterUid") || url.searchParams.get("inviterId") || void 0;
       const songId = url.searchParams.get("songId") || void 0;
@@ -252,7 +254,9 @@
         if (await this.resumeExistingRoom(selfUserId, data.existRoomId)) {
           return { roomId: this.roomId, creatorId: selfUserId, resumed: true };
         }
-        throw new Error("\u7F51\u6613\u4E91\u8D26\u53F7\u5DF2\u5728\u5176\u4ED6\u591A\u4EBA\u623F\u95F4\uFF0C\u8BF7\u5148\u5728\u624B\u673A\u7AEF\u9000\u51FA\u8BE5\u623F\u95F4\u540E\u518D\u521B\u5EFA");
+        throw new Error(
+          "\u7F51\u6613\u4E91\u8D26\u53F7\u5DF2\u5728\u5176\u4ED6\u591A\u4EBA\u623F\u95F4\uFF0C\u8BF7\u5148\u5728\u624B\u673A\u7AEF\u9000\u51FA\u8BE5\u623F\u95F4\u540E\u518D\u521B\u5EFA"
+        );
       }
       this.assertRoomAccepted(data, "\u521B\u5EFA");
       const snapshot = data.multiLtRoomSnapshot;
@@ -289,7 +293,9 @@
       const data = await this.api.joinRoom(roomId, inviterId);
       if (data.failedType === "MULTI_ACK_ALREADY_IN_ROOM" || data.existRoomId) {
         if (data.existRoomId && String(data.existRoomId) !== String(roomId)) {
-          throw new Error("\u7F51\u6613\u4E91\u8D26\u53F7\u4ECD\u5728\u53E6\u4E00\u4E2A\u591A\u4EBA\u623F\u95F4\uFF0C\u8BF7\u5148\u9000\u51FA\u539F\u623F\u95F4\u540E\u518D\u52A0\u5165\u9080\u8BF7\u623F\u95F4");
+          throw new Error(
+            "\u7F51\u6613\u4E91\u8D26\u53F7\u4ECD\u5728\u53E6\u4E00\u4E2A\u591A\u4EBA\u623F\u95F4\uFF0C\u8BF7\u5148\u9000\u51FA\u539F\u623F\u95F4\u540E\u518D\u52A0\u5165\u9080\u8BF7\u623F\u95F4"
+          );
         }
         if (await this.resumeExistingRoom(selfUserId, roomId)) return;
         throw new Error("\u7F51\u6613\u4E91\u8D26\u53F7\u5DF2\u5728\u5176\u4ED6\u591A\u4EBA\u623F\u95F4\uFF0C\u8BF7\u5148\u5728\u624B\u673A\u7AEF\u9000\u51FA\u540E\u518D\u52A0\u5165");
@@ -344,8 +350,11 @@
       };
     }
     async detailedSnapshot() {
-      if (this.inRoom) await this.refreshPinCounts();
-      const ids = [...this.playlist.map((song) => String(song.songId)), ...this.playedSongs];
+      if (this.inRoom) void this.refreshPinCounts();
+      const ids = [
+        ...this.playlist.map((song) => String(song.songId)),
+        ...this.playedSongs
+      ];
       const missing = [...new Set(ids)].filter((id) => !this.songCache.has(id)).slice(0, 50);
       if (missing.length) {
         try {
@@ -362,6 +371,9 @@
         }
       }
       return this.snapshot;
+    }
+    cacheTrack(track) {
+      if (track.source === "netease") this.songCache.set(String(track.id), track);
     }
     onLocalEvent(kind, data) {
       if (!this.running || kind !== "playStateChange" || !data.state) return;
@@ -382,6 +394,7 @@
         });
       }
       this.ctx.log.info(`[\u591A\u4EBA\u4E00\u8D77\u542C] \u5DF2\u63A8\u6B4C ${id}`);
+      this.scheduleHeartbeat(1500);
     }
     async pinSong(songId) {
       const roomId = this.requireRoom();
@@ -401,8 +414,10 @@
         2
       );
       if (data.roomSongInfo) this.updateRoomQueue(data.roomSongInfo, false);
+      const bizId = String(song.songBizId);
+      this.pinCounts.set(bizId, (this.pinCounts.get(bizId) ?? 0) + 1);
       this.historyCheckedAt = Number.NEGATIVE_INFINITY;
-      await this.refreshPinCounts();
+      void this.refreshPinCounts();
     }
     async goto(songId, loadLocally = true) {
       const roomId = this.requireRoom();
@@ -424,7 +439,11 @@
       if (data.roomSongInfo) this.updateRoomQueue(data.roomSongInfo, false);
       this.recordPlayed(id);
       const selected = this.findSong(id) ?? song;
-      if (selected) this.playlist = [selected, ...this.playlist.filter((song2) => String(song2.songId) !== id)];
+      if (selected)
+        this.playlist = [
+          selected,
+          ...this.playlist.filter((song2) => String(song2.songId) !== id)
+        ];
       this.currentSongId = id;
       this.paused = false;
       this.pendingPlayback = {
@@ -441,7 +460,9 @@
       const previousId = this.currentSongId;
       await this.runHeartbeat(false);
       if (!this.inRoom || this.currentSongId !== previousId) return;
-      const next = this.playlist.find((song) => String(song.songId) !== this.currentSongId);
+      const next = this.playlist.find(
+        (song) => String(song.songId) !== this.currentSongId
+      );
       if (!next) {
         this.ctx.player.pause();
         return;
@@ -514,7 +535,8 @@
         return false;
       }
       const roomId = snapshot?.roomId ?? snapshot?.multiRoomInfoDTO?.roomId;
-      if (!roomId || expectedRoomId && String(roomId) !== String(expectedRoomId)) return false;
+      if (!roomId || expectedRoomId && String(roomId) !== String(expectedRoomId))
+        return false;
       this.startRoom(String(roomId), selfUserId, selfUserId, snapshot);
       if (snapshot?.roomPlaySongInfo) {
         await this.applyRoomSongInfo(snapshot.roomPlaySongInfo, 0, true);
@@ -561,24 +583,7 @@
             false
           );
         }
-        try {
-          const status = await this.api.roomStatus();
-          if (this.running && this.roomId === roomId) {
-            const snapshot = status.multiLtRoomSnapshot;
-            const statusRoomId = snapshot?.roomId ?? snapshot?.multiRoomInfoDTO?.roomId;
-            if (snapshot?.multiLtRoomUserAgg && (!statusRoomId || statusRoomId === roomId)) {
-              const users = snapshot.multiLtRoomUserAgg.onlineUserInfos ?? [];
-              this.memberCount = Math.max(1, Number(snapshot.multiLtRoomUserAgg.onlineNums ?? users.length), users.length);
-              this.members = users.filter((user) => user.uid !== void 0 || user.userId !== void 0).map((user) => ({
-                userId: String(user.uid ?? user.userId),
-                nickname: user.nickname || `\u7528\u6237 ${user.uid ?? user.userId}`,
-                avatarUrl: user.avatar ?? user.avatarUrl
-              }));
-            }
-          }
-        } catch {
-        }
-        await this.refreshPinCounts();
+        await Promise.all([this.refreshMembers(roomId), this.refreshPinCounts()]);
       } catch (error) {
         if (error instanceof NeteaseApiError && error.code === "488") {
           this.resetRoom();
@@ -596,9 +601,33 @@
             this.endedFastPolls -= 1;
             this.scheduleHeartbeat(2e3);
           } else {
-            this.scheduleHeartbeat(nextHeartbeatDelay(this.heartbeatMs / 1e3, this.backoff));
+            this.scheduleHeartbeat(
+              nextHeartbeatDelay(this.heartbeatMs / 1e3, this.backoff)
+            );
           }
         }
+      }
+    }
+    async refreshMembers(roomId) {
+      try {
+        const status = await this.api.roomStatus();
+        if (!this.running || this.roomId !== roomId) return;
+        const snapshot = status.multiLtRoomSnapshot;
+        const statusRoomId = snapshot?.roomId ?? snapshot?.multiRoomInfoDTO?.roomId;
+        if (!snapshot?.multiLtRoomUserAgg || statusRoomId && statusRoomId !== roomId)
+          return;
+        const users = snapshot.multiLtRoomUserAgg.onlineUserInfos ?? [];
+        this.memberCount = Math.max(
+          1,
+          Number(snapshot.multiLtRoomUserAgg.onlineNums ?? users.length),
+          users.length
+        );
+        this.members = users.filter((user) => user.uid !== void 0 || user.userId !== void 0).map((user) => ({
+          userId: String(user.uid ?? user.userId),
+          nickname: user.nickname || `\u7528\u6237 ${user.uid ?? user.userId}`,
+          avatarUrl: user.avatar ?? user.avatarUrl
+        }));
+      } catch {
       }
     }
     async applyRoomSongInfo(info, halfRttMs, force) {
@@ -674,7 +703,8 @@
           );
           for (const record of records) {
             const resource = record.resourceInfo;
-            if (resource?.bizId === void 0 || resource.upCnt === void 0) continue;
+            if (resource?.bizId === void 0 || resource.upCnt === void 0)
+              continue;
             const count = Number(resource.upCnt);
             if (Number.isSafeInteger(count) && count >= 0) {
               this.pinCounts.set(String(resource.bizId), count);
@@ -904,6 +934,7 @@
         if (!engine.inRoom) return { error: "\u8BF7\u5148\u52A0\u5165\u4E00\u8D77\u542C" };
         if (!isNeteaseTrack(track)) return { error: "\u4EC5\u652F\u6301\u63A8\u7F51\u6613\u4E91\u5728\u7EBF\u6B4C\u66F2" };
         try {
+          engine.cacheTrack(track);
           await engine.pushSong(String(track.id));
           if (ctx.getSetting(SETTING_PIN_AFTER_PUSH))
             await engine.pinSong(String(track.id));
