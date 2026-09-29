@@ -98,6 +98,9 @@ const harness = (
     get plays() {
       return plays;
     },
+    advance: (ms: number) => {
+      now += ms;
+    },
     create: () =>
       engine.create({
         id: "1",
@@ -235,4 +238,119 @@ test("本机音源失败只恢复当前歌曲，不提交房间切歌操作", as
     h.calls.some((call) => call.name === "listentogether_multi_song_operate"),
     false,
   );
+});
+
+test("两秒状态查询展示他人推歌及完整资料，不等待保活心跳", async () => {
+  let remote = false;
+  const h = harness((name) => {
+    if (name === "listentogether_multi_match_status_get" && remote)
+      return response({
+        multiLtRoomSnapshot: {
+          roomId: "room",
+          roomPlaySongInfo: {
+            ...h.info,
+            version: 2,
+            nextSongs: [{ songId: "3", songBizId: "remote" }],
+          },
+          multiLtRoomUserAgg: {
+            onlineNums: 2,
+            onlineUserInfos: [{ uid: 8, nickname: "好友" }],
+          },
+        },
+      });
+  });
+  await h.create();
+  await h.tick();
+  const heartbeats = h.calls.filter(
+    (c) => c.name === "listentogether_multi_heartbeat",
+  ).length;
+  remote = true;
+  h.advance(2000);
+  const snapshot = await h.engine.detailedSnapshot();
+  assert.equal(snapshot.queue[1]?.songId, "3");
+  assert.equal(snapshot.queue[1]?.track?.title, "歌曲 3");
+  assert.equal(snapshot.memberCount, 2);
+  assert.equal(
+    h.calls.filter((c) => c.name === "listentogether_multi_heartbeat").length,
+    heartbeats,
+  );
+  assert.ok(
+    !h.calls.some((c) => c.name === "listentogether_multi_song_operate"),
+  );
+});
+
+test("并发状态查询只请求一次，退出后迟到结果失效", async () => {
+  const pending = deferred<unknown>();
+  let wait = false;
+  const h = harness((name) =>
+    name === "listentogether_multi_match_status_get" && wait
+      ? pending.promise
+      : undefined,
+  );
+  await h.create();
+  wait = true;
+  const before = h.calls.filter(
+    (c) => c.name === "listentogether_multi_match_status_get",
+  ).length;
+  const a = h.engine.detailedSnapshot();
+  const b = h.engine.detailedSnapshot();
+  assert.equal(
+    h.calls.filter((c) => c.name === "listentogether_multi_match_status_get")
+      .length,
+    before + 1,
+  );
+  await h.engine.leave();
+  pending.resolve(
+    response({
+      multiLtRoomSnapshot: { roomId: "room", roomPlaySongInfo: h.info },
+    }),
+  );
+  await Promise.all([a, b]);
+  assert.equal(h.engine.snapshot.inRoom, false);
+  assert.deepEqual(h.engine.snapshot.queue, []);
+});
+
+test("快速查询限流后退避，不随每次界面刷新重复请求", async () => {
+  let fail = false;
+  const h = harness((name) =>
+    name === "listentogether_multi_match_status_get" && fail
+      ? { status: 429, body: { code: 429 } }
+      : undefined,
+  );
+  await h.create();
+  fail = true;
+  await h.engine.detailedSnapshot();
+  const count = h.calls.length;
+  h.advance(2000);
+  await h.engine.detailedSnapshot();
+  assert.equal(h.calls.length, count);
+  h.advance(2000);
+  await h.engine.detailedSnapshot();
+  assert.ok(h.calls.length > count);
+});
+
+test("较早发出的心跳不能覆盖快速查询得到的新队列", async () => {
+  const old = deferred<unknown>();
+  let wait = false;
+  const h = harness((name) => {
+    if (name === "listentogether_multi_heartbeat" && wait) return old.promise;
+    if (name === "listentogether_multi_match_status_get" && wait)
+      return response({
+        multiLtRoomSnapshot: {
+          roomId: "room",
+          roomPlaySongInfo: {
+            ...h.info,
+            nextSongs: [{ songId: "4", songBizId: "new" }],
+          },
+        },
+      });
+  });
+  await h.create();
+  wait = true;
+  await h.tick();
+  await h.engine.detailedSnapshot();
+  assert.equal(h.engine.snapshot.queue[1]?.songId, "4");
+  old.resolve(response({ roomPlaySongInfo: h.info, heartBeatDuration: 20 }));
+  await flush();
+  assert.equal(h.engine.snapshot.queue[1]?.songId, "4");
 });

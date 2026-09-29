@@ -64,8 +64,7 @@ export const createNeteaseApi = (ctx: SplayerContext) => {
     }
 
     const body = res.body as
-      | { code?: number | string; message?: string; msg?: string }
-      | T;
+      { code?: number | string; message?: string; msg?: string } | T;
     const code = (body as { code?: number | string })?.code;
     if (res.status !== 200 || (code !== undefined && Number(code) !== 200)) {
       const message =
@@ -84,7 +83,8 @@ export const createNeteaseApi = (ctx: SplayerContext) => {
   return {
     async securityToken(): Promise<string> {
       const body = await call<{ code: number; token?: string }>(NET.token);
-      if (!body.token) throw new Error("无法获取网易云房间校验 token，请稍后重试");
+      if (!body.token)
+        throw new Error("无法获取网易云房间校验 token，请稍后重试");
       return body.token;
     },
     async createRoom(args: {
@@ -135,15 +135,18 @@ export const createNeteaseApi = (ctx: SplayerContext) => {
     },
 
     async roomStatus(): Promise<MultiRoomAckData> {
-      const body = await call<{ code: number; data?: MultiRoomAckData }>(NET.status);
+      const body = await call<{ code: number; data?: MultiRoomAckData }>(
+        NET.status,
+      );
       return body.data ?? {};
     },
 
     async roomHistory(roomId: string): Promise<MultiRoomMessageHistory> {
-      const body = await call<{ code: number; data?: MultiRoomMessageHistory; records?: MultiRoomMessageHistory["records"] }>(
-        NET.history,
-        { roomId },
-      );
+      const body = await call<{
+        code: number;
+        data?: MultiRoomMessageHistory;
+        records?: MultiRoomMessageHistory["records"];
+      }>(NET.history, { roomId });
       return body.data ?? { records: body.records };
     },
 
@@ -159,7 +162,8 @@ export const createNeteaseApi = (ctx: SplayerContext) => {
         { roomId, songId, bizId, operate, securityToken },
       );
       const data = body.data ?? {};
-      if (data.failedCode || data.failedMsg) {
+      // 官方 SUCCESS = 0；failedMsg 在成功时也会携带“推荐成功”等提示。
+      if (data.failedCode != null && Number(data.failedCode) !== 0) {
         throw new Error(data.failedMsg || `歌曲操作失败（${data.failedCode}）`);
       }
       return data;

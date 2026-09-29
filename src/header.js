@@ -1,7 +1,7 @@
 /**
  * @name        网易云多人一起听
  * @id          splayer.netease-together
- * @version     1.3.4
+ * @version     1.3.5
  * @description 使用网易云官方多人房间，与手机端和其他 SPlayer 同步播放、推歌与置顶
  * @author      Sisyphus
  * @type        control

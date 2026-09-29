@@ -21,6 +21,7 @@ const MIN_HEARTBEAT_MS = 2_000;
 const MAX_HEARTBEAT_MS = 30_000;
 const SEEK_THRESHOLD_MS = 2_000;
 const MAX_BACKOFF = 4;
+const ROOM_REFRESH_MS = 1_800;
 
 export interface ParsedRoomLink {
   roomId?: string;
@@ -129,6 +130,11 @@ export class TogetherSyncEngine {
   private metadataLoading: Promise<void> | null = null;
   private metadataCheckedAt = Number.NEGATIVE_INFINITY;
   private heartbeatLoading: Promise<void> | null = null;
+  private roomRefreshLoading: Promise<void> | null = null;
+  private roomRefreshAt = 0;
+  private roomRefreshBackoff = ROOM_REFRESH_MS;
+  private readSequence = 0;
+  private appliedReadSequence = 0;
   private loadingSong: string | null = null;
   private loadRetryAt = 0;
   private loadAttempts = 0;
@@ -329,14 +335,17 @@ export class TogetherSyncEngine {
   }
 
   async detailedSnapshot() {
+    // 页面每两秒查询一次真实房间；保活心跳仍遵循服务端间隔。
+    await this.refreshRoomState();
     // 历史消息只用于补充置顶数，不应阻塞房间页面和每次操作的回显。
     if (this.inRoom) void this.refreshPinCounts();
-    void this.refreshSongDetails();
+    await this.refreshSongDetails();
     return this.snapshot;
   }
 
   private async refreshSongDetails(): Promise<void> {
-    if (!this.inRoom || this.metadataLoading) return;
+    if (!this.inRoom) return;
+    if (this.metadataLoading) return this.metadataLoading;
     if (this.timers.now() - this.metadataCheckedAt < 5_000) return;
     const session = this.session;
     const ids = [
@@ -353,6 +362,8 @@ export class TogetherSyncEngine {
           const songs = await this.api.songDetail(missing);
           if (session !== this.session) return;
           for (const song of songs) this.cacheTrack(toTogetherTrack(song));
+          if (missing.every((id) => this.songCache.has(id)))
+            this.metadataCheckedAt = Number.NEGATIVE_INFINITY;
         } catch (error) {
           this.ctx.log.warn("[多人一起听] 读取房间歌曲信息失败：", error);
         }
@@ -690,6 +701,7 @@ export class TogetherSyncEngine {
     const roomId = this.roomId;
     const session = this.session;
     const revision = this.mutationRevision;
+    const readSequence = ++this.readSequence;
     const startedAt = this.timers.now();
     try {
       const data = await this.api.heartbeat(roomId);
@@ -704,7 +716,12 @@ export class TogetherSyncEngine {
       }
       this.heartbeatMs = nextHeartbeatDelay(data.heartBeatDuration);
       this.backoff = 1;
-      if (data.roomPlaySongInfo && revision === this.mutationRevision) {
+      if (
+        data.roomPlaySongInfo &&
+        revision === this.mutationRevision &&
+        readSequence > this.appliedReadSequence
+      ) {
+        this.appliedReadSequence = readSequence;
         await this.applyRoomSongInfo(
           data.roomPlaySongInfo,
           Math.max(0, (endedAt - startedAt) / 2),
@@ -713,7 +730,7 @@ export class TogetherSyncEngine {
       }
       // 成员和置顶数是附加信息，并行读取，避免互相拖慢下一次房间同步。
       if (session !== this.session) return;
-      void this.refreshMembers(roomId);
+      void this.refreshRoomState();
       void this.refreshPinCounts();
     } catch (error) {
       if (session !== this.session) return;
@@ -747,34 +764,68 @@ export class TogetherSyncEngine {
     }
   }
 
-  private async refreshMembers(roomId: string): Promise<void> {
+  private async refreshRoomState(): Promise<void> {
+    if (!this.inRoom) return;
+    if (this.roomRefreshLoading) return this.roomRefreshLoading;
+    if (this.timers.now() < this.roomRefreshAt) return;
+    const roomId = this.roomId;
     const session = this.session;
+    const revision = this.mutationRevision;
+    const readSequence = ++this.readSequence;
+    const startedAt = this.timers.now();
+    this.roomRefreshAt = startedAt + ROOM_REFRESH_MS;
+    const task = (async () => {
+      try {
+        const status = await this.api.roomStatus();
+        if (!this.running || session !== this.session) return;
+        const snapshot = status.multiLtRoomSnapshot;
+        const statusRoomId =
+          snapshot?.roomId ?? snapshot?.multiRoomInfoDTO?.roomId;
+        if (!snapshot || String(statusRoomId) !== roomId) return;
+        this.roomRefreshBackoff = ROOM_REFRESH_MS;
+        if (snapshot.multiRoomInfoDTO?.roomClosed) {
+          this.resetRoom();
+          return;
+        }
+        if (
+          snapshot.roomPlaySongInfo &&
+          revision === this.mutationRevision &&
+          readSequence > this.appliedReadSequence
+        ) {
+          this.appliedReadSequence = readSequence;
+          this.lastSyncedAt = this.timers.now();
+          await this.applyRoomSongInfo(
+            snapshot.roomPlaySongInfo,
+            (this.timers.now() - startedAt) / 2,
+            false,
+          );
+        }
+        if (session !== this.session || !snapshot.multiLtRoomUserAgg) return;
+        const users = snapshot.multiLtRoomUserAgg.onlineUserInfos ?? [];
+        this.memberCount = Math.max(
+          1,
+          Number(snapshot.multiLtRoomUserAgg.onlineNums ?? users.length),
+          users.length,
+        );
+        this.members = users
+          .filter((user) => user.uid !== undefined || user.userId !== undefined)
+          .map((user) => ({
+            userId: String(user.uid ?? user.userId),
+            nickname: user.nickname || `用户 ${user.uid ?? user.userId}`,
+            avatarUrl: user.avatar ?? user.avatarUrl,
+          }));
+      } catch (error) {
+        if (session !== this.session) return;
+        this.roomRefreshBackoff = Math.min(30_000, this.roomRefreshBackoff * 2);
+        this.roomRefreshAt = this.timers.now() + this.roomRefreshBackoff;
+        this.ctx.log.warn("[多人一起听] 快速刷新失败，已延后重试：", error);
+      }
+    })();
+    this.roomRefreshLoading = task;
     try {
-      const status = await this.api.roomStatus();
-      if (!this.running || session !== this.session) return;
-      const snapshot = status.multiLtRoomSnapshot;
-      const statusRoomId =
-        snapshot?.roomId ?? snapshot?.multiRoomInfoDTO?.roomId;
-      if (
-        !snapshot?.multiLtRoomUserAgg ||
-        (statusRoomId && statusRoomId !== roomId)
-      )
-        return;
-      const users = snapshot.multiLtRoomUserAgg.onlineUserInfos ?? [];
-      this.memberCount = Math.max(
-        1,
-        Number(snapshot.multiLtRoomUserAgg.onlineNums ?? users.length),
-        users.length,
-      );
-      this.members = users
-        .filter((user) => user.uid !== undefined || user.userId !== undefined)
-        .map((user) => ({
-          userId: String(user.uid ?? user.userId),
-          nickname: user.nickname || `用户 ${user.uid ?? user.userId}`,
-          avatarUrl: user.avatar ?? user.avatarUrl,
-        }));
-    } catch {
-      // 成员查询失败不影响房间时间线与下一次心跳。
+      await task;
+    } finally {
+      if (this.roomRefreshLoading === task) this.roomRefreshLoading = null;
     }
   }
 
@@ -882,7 +933,7 @@ export class TogetherSyncEngine {
   private async refreshPinCounts(): Promise<void> {
     if (!this.roomId || !this.running) return;
     if (this.historyLoading) return this.historyLoading;
-    if (this.timers.now() - this.historyCheckedAt < 10_000) return;
+    if (this.timers.now() - this.historyCheckedAt < 4_000) return;
     const roomId = this.roomId;
     const session = this.session;
     this.historyCheckedAt = this.timers.now();
@@ -983,6 +1034,10 @@ export class TogetherSyncEngine {
     this.metadataLoading = null;
     this.metadataCheckedAt = Number.NEGATIVE_INFINITY;
     this.heartbeatLoading = null;
+    this.roomRefreshLoading = null;
+    this.roomRefreshAt = 0;
+    this.roomRefreshBackoff = ROOM_REFRESH_MS;
+    this.appliedReadSequence = 0;
     this.loadingSong = null;
     this.loadRetryAt = 0;
     this.loadAttempts = 0;

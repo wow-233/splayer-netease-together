@@ -1,7 +1,7 @@
 /**
  * @name        网易云多人一起听
  * @id          splayer.netease-together
- * @version     1.3.4
+ * @version     1.3.5
  * @description 使用网易云官方多人房间，与手机端和其他 SPlayer 同步播放、推歌与置顶
  * @author      Sisyphus
  * @type        control
@@ -64,7 +64,8 @@
     return {
       async securityToken() {
         const body = await call(NET.token);
-        if (!body.token) throw new Error("\u65E0\u6CD5\u83B7\u53D6\u7F51\u6613\u4E91\u623F\u95F4\u6821\u9A8C token\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5");
+        if (!body.token)
+          throw new Error("\u65E0\u6CD5\u83B7\u53D6\u7F51\u6613\u4E91\u623F\u95F4\u6821\u9A8C token\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5");
         return body.token;
       },
       async createRoom(args) {
@@ -105,14 +106,13 @@
         return body.data ?? {};
       },
       async roomStatus() {
-        const body = await call(NET.status);
+        const body = await call(
+          NET.status
+        );
         return body.data ?? {};
       },
       async roomHistory(roomId) {
-        const body = await call(
-          NET.history,
-          { roomId }
-        );
+        const body = await call(NET.history, { roomId });
         return body.data ?? { records: body.records };
       },
       async operateSong(roomId, songId, bizId, operate) {
@@ -122,7 +122,7 @@
           { roomId, songId, bizId, operate, securityToken }
         );
         const data = body.data ?? {};
-        if (data.failedCode || data.failedMsg) {
+        if (data.failedCode != null && Number(data.failedCode) !== 0) {
           throw new Error(data.failedMsg || `\u6B4C\u66F2\u64CD\u4F5C\u5931\u8D25\uFF08${data.failedCode}\uFF09`);
         }
         return data;
@@ -165,6 +165,7 @@
   var MAX_HEARTBEAT_MS = 3e4;
   var SEEK_THRESHOLD_MS = 2e3;
   var MAX_BACKOFF = 4;
+  var ROOM_REFRESH_MS = 1800;
   var parseRoomLink = (input) => {
     const text = String(input ?? "").trim();
     if (!text) return { isMultiRoom: false };
@@ -225,6 +226,11 @@
     metadataLoading = null;
     metadataCheckedAt = Number.NEGATIVE_INFINITY;
     heartbeatLoading = null;
+    roomRefreshLoading = null;
+    roomRefreshAt = 0;
+    roomRefreshBackoff = ROOM_REFRESH_MS;
+    readSequence = 0;
+    appliedReadSequence = 0;
     loadingSong = null;
     loadRetryAt = 0;
     loadAttempts = 0;
@@ -369,12 +375,14 @@
       };
     }
     async detailedSnapshot() {
+      await this.refreshRoomState();
       if (this.inRoom) void this.refreshPinCounts();
-      void this.refreshSongDetails();
+      await this.refreshSongDetails();
       return this.snapshot;
     }
     async refreshSongDetails() {
-      if (!this.inRoom || this.metadataLoading) return;
+      if (!this.inRoom) return;
+      if (this.metadataLoading) return this.metadataLoading;
       if (this.timers.now() - this.metadataCheckedAt < 5e3) return;
       const session = this.session;
       const ids = [
@@ -389,6 +397,8 @@
             const songs = await this.api.songDetail(missing);
             if (session !== this.session) return;
             for (const song of songs) this.cacheTrack(toTogetherTrack(song));
+            if (missing.every((id) => this.songCache.has(id)))
+              this.metadataCheckedAt = Number.NEGATIVE_INFINITY;
           } catch (error) {
             this.ctx.log.warn("[\u591A\u4EBA\u4E00\u8D77\u542C] \u8BFB\u53D6\u623F\u95F4\u6B4C\u66F2\u4FE1\u606F\u5931\u8D25\uFF1A", error);
           }
@@ -673,6 +683,7 @@
       const roomId = this.roomId;
       const session = this.session;
       const revision = this.mutationRevision;
+      const readSequence = ++this.readSequence;
       const startedAt = this.timers.now();
       try {
         const data = await this.api.heartbeat(roomId);
@@ -687,7 +698,8 @@
         }
         this.heartbeatMs = nextHeartbeatDelay(data.heartBeatDuration);
         this.backoff = 1;
-        if (data.roomPlaySongInfo && revision === this.mutationRevision) {
+        if (data.roomPlaySongInfo && revision === this.mutationRevision && readSequence > this.appliedReadSequence) {
+          this.appliedReadSequence = readSequence;
           await this.applyRoomSongInfo(
             data.roomPlaySongInfo,
             Math.max(0, (endedAt - startedAt) / 2),
@@ -695,7 +707,7 @@
           );
         }
         if (session !== this.session) return;
-        void this.refreshMembers(roomId);
+        void this.refreshRoomState();
         void this.refreshPinCounts();
       } catch (error) {
         if (session !== this.session) return;
@@ -723,27 +735,61 @@
         }
       }
     }
-    async refreshMembers(roomId) {
+    async refreshRoomState() {
+      if (!this.inRoom) return;
+      if (this.roomRefreshLoading) return this.roomRefreshLoading;
+      if (this.timers.now() < this.roomRefreshAt) return;
+      const roomId = this.roomId;
       const session = this.session;
+      const revision = this.mutationRevision;
+      const readSequence = ++this.readSequence;
+      const startedAt = this.timers.now();
+      this.roomRefreshAt = startedAt + ROOM_REFRESH_MS;
+      const task = (async () => {
+        try {
+          const status = await this.api.roomStatus();
+          if (!this.running || session !== this.session) return;
+          const snapshot = status.multiLtRoomSnapshot;
+          const statusRoomId = snapshot?.roomId ?? snapshot?.multiRoomInfoDTO?.roomId;
+          if (!snapshot || String(statusRoomId) !== roomId) return;
+          this.roomRefreshBackoff = ROOM_REFRESH_MS;
+          if (snapshot.multiRoomInfoDTO?.roomClosed) {
+            this.resetRoom();
+            return;
+          }
+          if (snapshot.roomPlaySongInfo && revision === this.mutationRevision && readSequence > this.appliedReadSequence) {
+            this.appliedReadSequence = readSequence;
+            this.lastSyncedAt = this.timers.now();
+            await this.applyRoomSongInfo(
+              snapshot.roomPlaySongInfo,
+              (this.timers.now() - startedAt) / 2,
+              false
+            );
+          }
+          if (session !== this.session || !snapshot.multiLtRoomUserAgg) return;
+          const users = snapshot.multiLtRoomUserAgg.onlineUserInfos ?? [];
+          this.memberCount = Math.max(
+            1,
+            Number(snapshot.multiLtRoomUserAgg.onlineNums ?? users.length),
+            users.length
+          );
+          this.members = users.filter((user) => user.uid !== void 0 || user.userId !== void 0).map((user) => ({
+            userId: String(user.uid ?? user.userId),
+            nickname: user.nickname || `\u7528\u6237 ${user.uid ?? user.userId}`,
+            avatarUrl: user.avatar ?? user.avatarUrl
+          }));
+        } catch (error) {
+          if (session !== this.session) return;
+          this.roomRefreshBackoff = Math.min(3e4, this.roomRefreshBackoff * 2);
+          this.roomRefreshAt = this.timers.now() + this.roomRefreshBackoff;
+          this.ctx.log.warn("[\u591A\u4EBA\u4E00\u8D77\u542C] \u5FEB\u901F\u5237\u65B0\u5931\u8D25\uFF0C\u5DF2\u5EF6\u540E\u91CD\u8BD5\uFF1A", error);
+        }
+      })();
+      this.roomRefreshLoading = task;
       try {
-        const status = await this.api.roomStatus();
-        if (!this.running || session !== this.session) return;
-        const snapshot = status.multiLtRoomSnapshot;
-        const statusRoomId = snapshot?.roomId ?? snapshot?.multiRoomInfoDTO?.roomId;
-        if (!snapshot?.multiLtRoomUserAgg || statusRoomId && statusRoomId !== roomId)
-          return;
-        const users = snapshot.multiLtRoomUserAgg.onlineUserInfos ?? [];
-        this.memberCount = Math.max(
-          1,
-          Number(snapshot.multiLtRoomUserAgg.onlineNums ?? users.length),
-          users.length
-        );
-        this.members = users.filter((user) => user.uid !== void 0 || user.userId !== void 0).map((user) => ({
-          userId: String(user.uid ?? user.userId),
-          nickname: user.nickname || `\u7528\u6237 ${user.uid ?? user.userId}`,
-          avatarUrl: user.avatar ?? user.avatarUrl
-        }));
-      } catch {
+        await task;
+      } finally {
+        if (this.roomRefreshLoading === task) this.roomRefreshLoading = null;
       }
     }
     async applyRoomSongInfo(info, halfRttMs, force) {
@@ -832,7 +878,7 @@
     async refreshPinCounts() {
       if (!this.roomId || !this.running) return;
       if (this.historyLoading) return this.historyLoading;
-      if (this.timers.now() - this.historyCheckedAt < 1e4) return;
+      if (this.timers.now() - this.historyCheckedAt < 4e3) return;
       const roomId = this.roomId;
       const session = this.session;
       this.historyCheckedAt = this.timers.now();
@@ -916,6 +962,10 @@
       this.metadataLoading = null;
       this.metadataCheckedAt = Number.NEGATIVE_INFINITY;
       this.heartbeatLoading = null;
+      this.roomRefreshLoading = null;
+      this.roomRefreshAt = 0;
+      this.roomRefreshBackoff = ROOM_REFRESH_MS;
+      this.appliedReadSequence = 0;
       this.loadingSong = null;
       this.loadRetryAt = 0;
       this.loadAttempts = 0;
