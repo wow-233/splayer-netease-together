@@ -112,6 +112,7 @@ export class TogetherSyncEngine {
   private inviterId: string | null = null;
   private selfUserId = "";
   private currentSongId: string | null = null;
+  private currentSongBizId: string | null = null;
   private playlist: MultiSongInfo[] = [];
   private readonly songCache = new Map<string, TogetherTrack>();
   private readonly pinCounts = new Map<string, number>();
@@ -121,6 +122,18 @@ export class TogetherSyncEngine {
   >();
   private historyCheckedAt = Number.NEGATIVE_INFINITY;
   private historyLoading: Promise<void> | null = null;
+  private session = 0;
+  private mutationRevision = 0;
+  private readonly pinned = new Set<string>();
+  private readonly pinning = new Set<string>();
+  private metadataLoading: Promise<void> | null = null;
+  private metadataCheckedAt = Number.NEGATIVE_INFINITY;
+  private heartbeatLoading: Promise<void> | null = null;
+  private loadingSong: string | null = null;
+  private loadRetryAt = 0;
+  private loadAttempts = 0;
+  private syncError = "";
+  private lastSyncedAt = 0;
   private playedSongs: string[] = [];
   private memberCount = 1;
   private members: Array<{
@@ -186,6 +199,10 @@ export class TogetherSyncEngine {
     if (!roomId) throw new Error("创建多人房间失败：服务端未返回房间号");
     this.startRoom(String(roomId), selfUserId, selfUserId, snapshot);
     this.currentSongId = String(initialTrack.id);
+    this.currentSongBizId =
+      snapshot?.roomPlaySongInfo?.playSong?.songBizId === undefined
+        ? null
+        : String(snapshot.roomPlaySongInfo.playSong.songBizId);
     if (!this.playlist.length) this.playlist = [{ songId: initialTrack.id }];
     if (snapshot?.roomPlaySongInfo) {
       await this.applyRoomSongInfo(snapshot.roomPlaySongInfo, 0, true);
@@ -265,8 +282,12 @@ export class TogetherSyncEngine {
     memberCount: number;
     members: Array<{ userId: string; nickname: string; avatarUrl?: string }>;
     paused: boolean;
+    syncError: string;
+    lastSyncedAt: number;
     queue: Array<{
       songId: string;
+      songBizId?: string;
+      pinned?: boolean;
       track?: TogetherTrack;
       recommendedBy?: string;
       pinCount?: number;
@@ -283,8 +304,16 @@ export class TogetherSyncEngine {
       memberCount: this.memberCount,
       members: this.members,
       paused: this.paused,
+      syncError: this.syncError,
+      lastSyncedAt: this.lastSyncedAt,
       queue: this.playlist.map((song) => ({
         songId: String(song.songId),
+        songBizId:
+          song.songBizId === undefined ? undefined : String(song.songBizId),
+        pinned:
+          song.songBizId === undefined
+            ? false
+            : this.pinned.has(String(song.songBizId)),
         track: this.songCache.get(String(song.songId)),
         recommendedBy: song.songRcmdUid ? String(song.songRcmdUid) : undefined,
         pinCount:
@@ -302,6 +331,14 @@ export class TogetherSyncEngine {
   async detailedSnapshot() {
     // 历史消息只用于补充置顶数，不应阻塞房间页面和每次操作的回显。
     if (this.inRoom) void this.refreshPinCounts();
+    void this.refreshSongDetails();
+    return this.snapshot;
+  }
+
+  private async refreshSongDetails(): Promise<void> {
+    if (!this.inRoom || this.metadataLoading) return;
+    if (this.timers.now() - this.metadataCheckedAt < 5_000) return;
+    const session = this.session;
     const ids = [
       ...this.playlist.map((song) => String(song.songId)),
       ...this.playedSongs,
@@ -310,24 +347,32 @@ export class TogetherSyncEngine {
       .filter((id) => !this.songCache.has(id))
       .slice(0, 50);
     if (missing.length) {
+      this.metadataCheckedAt = this.timers.now();
+      const task = (async () => {
+        try {
+          const songs = await this.api.songDetail(missing);
+          if (session !== this.session) return;
+          for (const song of songs) this.cacheTrack(toTogetherTrack(song));
+        } catch (error) {
+          this.ctx.log.warn("[多人一起听] 读取房间歌曲信息失败：", error);
+        }
+      })();
+      this.metadataLoading = task;
       try {
-        for (const song of await this.api.songDetail(missing)) {
-          this.songCache.set(String(song.id), toTogetherTrack(song));
-        }
-        while (this.songCache.size > 100) {
-          const oldest = this.songCache.keys().next().value;
-          if (oldest === undefined) break;
-          this.songCache.delete(oldest);
-        }
-      } catch (error) {
-        this.ctx.log.warn("[多人一起听] 读取房间歌曲信息失败：", error);
+        await task;
+      } finally {
+        if (this.metadataLoading === task) this.metadataLoading = null;
       }
     }
-    return this.snapshot;
   }
 
   cacheTrack(track: TogetherTrack): void {
     if (track.source === "netease") this.songCache.set(String(track.id), track);
+    while (this.songCache.size > 100) {
+      const oldest = this.songCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.songCache.delete(oldest);
+    }
   }
 
   onLocalEvent(
@@ -338,14 +383,19 @@ export class TogetherSyncEngine {
     },
   ): void {
     if (!this.running || kind !== "playStateChange" || !data.state) return;
+    const resuming = this.paused && data.state === "playing";
     this.paused = data.state !== "playing";
+    if (resuming && !this.pendingPlayback) this.scheduleHeartbeat(0);
   }
 
   async pushSong(songId: string): Promise<void> {
     const roomId = this.requireRoom();
+    const session = this.session;
     const id = String(songId);
     if (this.findSong(id)) return;
     const data = await this.api.operateSong(roomId, id, "0", 1);
+    this.assertSession(session);
+    this.mutationRevision += 1;
     if (data.roomSongInfo) {
       this.updateRoomQueue(data.roomSongInfo, false);
     }
@@ -359,43 +409,62 @@ export class TogetherSyncEngine {
     this.scheduleHeartbeat(1_500);
   }
 
-  async pinSong(songId: string): Promise<void> {
+  async pinSong(songId: string, songBizId?: string): Promise<void> {
     const roomId = this.requireRoom();
+    const session = this.session;
     const id = String(songId);
-    let song = this.findSong(id);
+    let song = this.findSong(id, songBizId);
     if (!song?.songBizId) {
-      await this.runHeartbeat(false);
-      song = this.findSong(id);
+      await this.runHeartbeat();
+      this.assertSession(session);
+      song = this.findSong(id, songBizId);
     }
     if (!song) throw new Error("这首歌尚未加入多人房间");
     if (!song.songBizId)
       throw new Error("房间尚未返回这首歌的队列编号，请稍后再试");
-    const data = await this.api.operateSong(
-      roomId,
-      id,
-      String(song.songBizId),
-      2,
-    );
-    if (data.roomSongInfo) this.updateRoomQueue(data.roomSongInfo, false);
     const bizId = String(song.songBizId);
-    const optimisticCount = (this.pinCounts.get(bizId) ?? 0) + 1;
-    this.pinCounts.set(bizId, optimisticCount);
-    this.pendingPinCounts.set(bizId, {
-      count: optimisticCount,
-      until: this.timers.now() + 10_000,
-    });
-    this.historyCheckedAt = Number.NEGATIVE_INFINITY;
-    void this.refreshPinCounts();
+    if (this.pinned.has(bizId) || this.pinning.has(bizId)) return;
+    this.pinning.add(bizId);
+    try {
+      const data = await this.api.operateSong(
+        roomId,
+        id,
+        String(song.songBizId),
+        2,
+      );
+      this.assertSession(session);
+      if (data.roomSongInfo) this.updateRoomQueue(data.roomSongInfo, false);
+      this.mutationRevision += 1;
+      this.pinned.add(bizId);
+      const optimisticCount = (this.pinCounts.get(bizId) ?? 0) + 1;
+      this.pinCounts.set(bizId, optimisticCount);
+      this.pendingPinCounts.set(bizId, {
+        count: optimisticCount,
+        until: this.timers.now() + 10_000,
+      });
+      this.historyCheckedAt = Number.NEGATIVE_INFINITY;
+      void this.refreshPinCounts();
+      this.scheduleHeartbeat(1_500);
+    } finally {
+      if (session === this.session) this.pinning.delete(bizId);
+    }
   }
 
-  async goto(songId: string, loadLocally = true): Promise<void> {
+  async goto(
+    songId: string,
+    loadLocally = true,
+    songBizId?: string,
+  ): Promise<void> {
     const roomId = this.requireRoom();
+    const session = this.session;
     const id = String(songId);
     if (!this.findSong(id)) await this.pushSong(id);
-    let song = this.findSong(id);
+    this.assertSession(session);
+    let song = this.findSong(id, songBizId);
     if (!song?.songBizId) {
-      await this.runHeartbeat(false);
-      song = this.findSong(id);
+      await this.runHeartbeat();
+      this.assertSession(session);
+      song = this.findSong(id, songBizId);
     }
     if (!song?.songBizId)
       throw new Error("房间尚未返回这首歌的队列编号，请稍后再试");
@@ -405,16 +474,21 @@ export class TogetherSyncEngine {
       String(song.songBizId),
       4,
     );
+    this.assertSession(session);
     if (data.roomSongInfo) this.updateRoomQueue(data.roomSongInfo, false);
+    this.mutationRevision += 1;
     // 歌曲操作成功后，以请求的歌曲为目标；操作响应可能仍是切换前的快照。
     this.recordPlayed(id);
-    const selected = this.findSong(id) ?? song;
+    const selected = this.findSong(id, songBizId) ?? song;
     if (selected)
       this.playlist = [
         selected,
-        ...this.playlist.filter((song) => String(song.songId) !== id),
+        ...this.playlist.filter(
+          (entry) => String(entry.songBizId) !== String(selected.songBizId),
+        ),
       ];
     this.currentSongId = id;
+    this.currentSongBizId = String(selected.songBizId);
     this.paused = false;
     this.pendingPlayback = {
       songId: id,
@@ -423,22 +497,38 @@ export class TogetherSyncEngine {
       at: this.timers.now(),
     };
     if (loadLocally) await this.loadTrack(id);
+    this.assertSession(session);
     this.scheduleHeartbeat(1500);
   }
 
   async next(): Promise<void> {
     this.requireRoom();
+    const session = this.session;
     const previousId = this.currentSongId;
-    await this.runHeartbeat(false);
+    await this.runHeartbeat();
+    this.assertSession(session);
     if (!this.inRoom || this.currentSongId !== previousId) return;
-    const next = this.playlist.find(
-      (song) => String(song.songId) !== this.currentSongId,
-    );
+    const next = this.playlist[1];
     if (!next) {
       this.ctx.player.pause();
       return;
     }
-    await this.goto(String(next.songId));
+    await this.goto(
+      String(next.songId),
+      true,
+      next.songBizId === undefined ? undefined : String(next.songBizId),
+    );
+  }
+
+  /** 本机暂停后先追上官方进度，再恢复声音。 */
+  async resumePlayback(): Promise<void> {
+    this.requireRoom();
+    const session = this.session;
+    this.paused = false;
+    await this.runHeartbeat();
+    this.assertSession(session);
+    if (this.syncError) throw new Error(this.syncError);
+    if (!this.pendingPlayback) this.ctx.player.play();
   }
 
   /** 自然播完只等待服务端推进时间线，不替所有人发“切歌”操作。 */
@@ -449,11 +539,26 @@ export class TogetherSyncEngine {
     this.scheduleHeartbeat(0);
   }
 
+  /** 本机音源不可用时重试当前房间歌曲，不触发全房间切歌。 */
+  onPlaybackFailed(): void {
+    if (!this.inRoom || !this.currentSongId) return;
+    this.pendingPlayback ??= {
+      songId: this.currentSongId,
+      position: 0,
+      playing: true,
+      at: this.timers.now(),
+    };
+    this.syncError = "当前歌曲暂时无法播放，正在重试；房间队列继续保留";
+    this.scheduleHeartbeat(2_000);
+  }
+
   async onLocalTrackChange(songId: string): Promise<void> {
     const id = String(songId);
     if (!this.running || !this.roomId || this.currentSongId === id) return;
+    const session = this.session;
     try {
       await this.pushSong(id);
+      this.assertSession(session);
       await this.goto(id, false);
     } catch (error) {
       this.ctx.log.warn(
@@ -470,6 +575,8 @@ export class TogetherSyncEngine {
       return null;
     const pending = this.pendingPlayback;
     this.pendingPlayback = null;
+    this.loadAttempts = 0;
+    this.syncError = "";
     return {
       position: pending.position + Math.max(0, this.timers.now() - pending.at),
       playing: pending.playing,
@@ -482,6 +589,7 @@ export class TogetherSyncEngine {
     selfUserId: string,
     snapshot?: MultiRoomSnapshot,
   ): void {
+    this.resetRoom();
     this.roomId = roomId;
     this.inviterId = inviterId;
     this.selfUserId = selfUserId;
@@ -566,14 +674,29 @@ export class TogetherSyncEngine {
     );
   }
 
-  private async runHeartbeat(reschedule = true): Promise<void> {
+  private async runHeartbeat(): Promise<void> {
+    if (this.heartbeatLoading) return this.heartbeatLoading;
+    const task = this.performHeartbeat(true);
+    this.heartbeatLoading = task;
+    try {
+      await task;
+    } finally {
+      if (this.heartbeatLoading === task) this.heartbeatLoading = null;
+    }
+  }
+
+  private async performHeartbeat(reschedule: boolean): Promise<void> {
     if (!this.running || !this.roomId) return;
     const roomId = this.roomId;
+    const session = this.session;
+    const revision = this.mutationRevision;
     const startedAt = this.timers.now();
     try {
       const data = await this.api.heartbeat(roomId);
-      if (!this.running || this.roomId !== roomId) return;
+      if (!this.running || session !== this.session) return;
       const endedAt = this.timers.now();
+      this.lastSyncedAt = endedAt;
+      if (!this.pendingPlayback) this.syncError = "";
       if (data.roomInfoDTO?.roomClosed) {
         this.resetRoom();
         this.ctx.log.warn("[多人一起听] 房间已结束");
@@ -581,7 +704,7 @@ export class TogetherSyncEngine {
       }
       this.heartbeatMs = nextHeartbeatDelay(data.heartBeatDuration);
       this.backoff = 1;
-      if (data.roomPlaySongInfo) {
+      if (data.roomPlaySongInfo && revision === this.mutationRevision) {
         await this.applyRoomSongInfo(
           data.roomPlaySongInfo,
           Math.max(0, (endedAt - startedAt) / 2),
@@ -589,8 +712,12 @@ export class TogetherSyncEngine {
         );
       }
       // 成员和置顶数是附加信息，并行读取，避免互相拖慢下一次房间同步。
-      await Promise.all([this.refreshMembers(roomId), this.refreshPinCounts()]);
+      if (session !== this.session) return;
+      void this.refreshMembers(roomId);
+      void this.refreshPinCounts();
     } catch (error) {
+      if (session !== this.session) return;
+      this.syncError = "房间连接暂时中断，正在重试";
       if (error instanceof NeteaseApiError && error.code === "488") {
         this.resetRoom();
         this.ctx.log.warn("[多人一起听] 房间已失效，请重新创建或加入");
@@ -604,10 +731,10 @@ export class TogetherSyncEngine {
         error instanceof Error ? error.message : error,
       );
     } finally {
-      if (reschedule && this.running) {
+      if (reschedule && this.running && session === this.session) {
         if (
-          this.endedSongId === this.currentSongId &&
-          this.endedFastPolls > 0
+          this.pendingPlayback ||
+          (this.endedSongId === this.currentSongId && this.endedFastPolls > 0)
         ) {
           this.endedFastPolls -= 1;
           this.scheduleHeartbeat(2_000);
@@ -621,9 +748,10 @@ export class TogetherSyncEngine {
   }
 
   private async refreshMembers(roomId: string): Promise<void> {
+    const session = this.session;
     try {
       const status = await this.api.roomStatus();
-      if (!this.running || this.roomId !== roomId) return;
+      if (!this.running || session !== this.session) return;
       const snapshot = status.multiLtRoomSnapshot;
       const statusRoomId =
         snapshot?.roomId ?? snapshot?.multiRoomInfoDTO?.roomId;
@@ -655,16 +783,23 @@ export class TogetherSyncEngine {
     halfRttMs: number,
     force: boolean,
   ): Promise<void> {
+    const session = this.session;
     if (!this.updateRoomQueue(info, force)) return;
     const playSong = info.playSong;
     if (playSong?.songId === undefined) return;
     const targetId = String(playSong.songId);
+    const targetBizId =
+      playSong.songBizId === undefined ? null : String(playSong.songBizId);
     const expected = expectedMultiPosition(info.playedTime, halfRttMs);
-    if (targetId !== this.currentSongId) {
+    if (
+      targetId !== this.currentSongId ||
+      (targetBizId !== null && targetBizId !== this.currentSongBizId)
+    ) {
       this.endedSongId = null;
       this.endedFastPolls = 0;
       this.recordPlayed(targetId);
       this.currentSongId = targetId;
+      this.currentSongBizId = targetBizId;
       this.paused = false;
       this.pendingPlayback = {
         songId: targetId,
@@ -679,10 +814,14 @@ export class TogetherSyncEngine {
       // 新曲仍在加载时，只更新待应用的服务端进度，避免 seek 到上一首。
       this.pendingPlayback.position = expected;
       this.pendingPlayback.at = this.timers.now();
+      if (!this.loadingSong && this.timers.now() >= this.loadRetryAt) {
+        await this.loadTrack(targetId);
+      }
       return;
     }
     if (this.paused && !force) return;
     const localPosition = await this.ctx.player.getPosition();
+    if (session !== this.session || targetId !== this.currentSongId) return;
     if (force || info.forceSync || needsSeek(localPosition, expected)) {
       this.ctx.player.seek(Math.round(expected));
     }
@@ -702,16 +841,40 @@ export class TogetherSyncEngine {
   }
 
   private async loadTrack(songId: string): Promise<void> {
+    if (this.loadingSong === songId) return;
+    const session = this.session;
+    this.loadingSong = songId;
     try {
-      const [song] = await this.api.songDetail([songId]);
-      if (!song) throw new Error("网易云未返回歌曲信息");
-      if (!this.running || this.currentSongId !== songId) return;
-      this.ctx.player.playTrack(toTogetherTrack(song));
+      let track = this.songCache.get(songId);
+      if (!track) {
+        const [song] = await this.api.songDetail([songId]);
+        if (!song) throw new Error("网易云未返回歌曲信息");
+        track = toTogetherTrack(song);
+      }
+      if (
+        !this.running ||
+        session !== this.session ||
+        this.currentSongId !== songId
+      )
+        return;
+      this.cacheTrack(track);
+      this.loadAttempts += 1;
+      this.loadRetryAt =
+        this.timers.now() + Math.min(30_000, 5_000 * this.loadAttempts);
+      this.ctx.player.playTrack(track);
     } catch (error) {
+      if (session !== this.session || this.currentSongId !== songId) return;
+      this.loadAttempts += 1;
+      this.loadRetryAt =
+        this.timers.now() + Math.min(30_000, 2_000 * this.loadAttempts);
+      this.syncError = "当前歌曲加载失败，正在重新连接房间播放";
       this.ctx.log.error(
         "[多人一起听] 加载歌曲失败：",
         error instanceof Error ? error.message : error,
       );
+    } finally {
+      if (session === this.session && this.loadingSong === songId)
+        this.loadingSong = null;
     }
   }
 
@@ -721,11 +884,12 @@ export class TogetherSyncEngine {
     if (this.historyLoading) return this.historyLoading;
     if (this.timers.now() - this.historyCheckedAt < 10_000) return;
     const roomId = this.roomId;
+    const session = this.session;
     this.historyCheckedAt = this.timers.now();
     this.historyLoading = (async () => {
       try {
         const history = await this.api.roomHistory(roomId);
-        if (!this.running || this.roomId !== roomId) return;
+        if (!this.running || session !== this.session) return;
         const records = [...(history.records ?? [])].sort(
           (a, b) => Number(a.sendTime ?? 0) - Number(b.sendTime ?? 0),
         );
@@ -739,12 +903,24 @@ export class TogetherSyncEngine {
             const pending = this.pendingPinCounts.get(bizId);
             if (
               pending &&
-              count < pending.count &&
+              (count < pending.count || resource.uped === false) &&
               this.timers.now() < pending.until
             )
               continue;
             this.pendingPinCounts.delete(bizId);
             this.pinCounts.set(bizId, count);
+            if (resource.uped === true) this.pinned.add(bizId);
+            else if (resource.uped === false) this.pinned.delete(bizId);
+          }
+        }
+        const activeIds = new Set(
+          this.playlist.map((song) => String(song.songBizId)),
+        );
+        for (const id of this.pinCounts.keys()) {
+          if (!activeIds.has(id)) {
+            this.pinCounts.delete(id);
+            this.pinned.delete(id);
+            this.pendingPinCounts.delete(id);
           }
         }
       } catch (error) {
@@ -753,14 +929,26 @@ export class TogetherSyncEngine {
           error instanceof Error ? error.message : error,
         );
       } finally {
-        this.historyLoading = null;
+        if (session === this.session) this.historyLoading = null;
       }
     })();
     return this.historyLoading;
   }
 
-  private findSong(songId: string): MultiSongInfo | undefined {
-    return this.playlist.find((song) => String(song.songId) === String(songId));
+  private findSong(
+    songId: string,
+    songBizId?: string,
+  ): MultiSongInfo | undefined {
+    return this.playlist.find(
+      (song) =>
+        String(song.songId) === String(songId) &&
+        (songBizId === undefined || String(song.songBizId) === songBizId),
+    );
+  }
+
+  private assertSession(session: number): void {
+    if (!this.inRoom || session !== this.session)
+      throw new Error("房间已切换，此次操作已结束");
   }
 
   private recordPlayed(nextSongId: string): void {
@@ -790,6 +978,18 @@ export class TogetherSyncEngine {
   }
 
   private resetRoom(): void {
+    this.session += 1;
+    this.historyLoading = null;
+    this.metadataLoading = null;
+    this.metadataCheckedAt = Number.NEGATIVE_INFINITY;
+    this.heartbeatLoading = null;
+    this.loadingSong = null;
+    this.loadRetryAt = 0;
+    this.loadAttempts = 0;
+    this.syncError = "";
+    this.lastSyncedAt = 0;
+    this.pinned.clear();
+    this.pinning.clear();
     this.running = false;
     if (this.heartbeatHandle) this.timers.clearTimeout(this.heartbeatHandle);
     this.heartbeatHandle = null;
@@ -797,6 +997,7 @@ export class TogetherSyncEngine {
     this.inviterId = null;
     this.selfUserId = "";
     this.currentSongId = null;
+    this.currentSongBizId = null;
     this.playlist = [];
     this.songCache.clear();
     this.pinCounts.clear();

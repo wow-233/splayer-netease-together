@@ -1,7 +1,7 @@
 /**
  * @name        网易云多人一起听
  * @id          splayer.netease-together
- * @version     1.3.3
+ * @version     1.3.4
  * @description 使用网易云官方多人房间，与手机端和其他 SPlayer 同步播放、推歌与置顶
  * @author      Sisyphus
  * @type        control
@@ -211,12 +211,25 @@
     inviterId = null;
     selfUserId = "";
     currentSongId = null;
+    currentSongBizId = null;
     playlist = [];
     songCache = /* @__PURE__ */ new Map();
     pinCounts = /* @__PURE__ */ new Map();
     pendingPinCounts = /* @__PURE__ */ new Map();
     historyCheckedAt = Number.NEGATIVE_INFINITY;
     historyLoading = null;
+    session = 0;
+    mutationRevision = 0;
+    pinned = /* @__PURE__ */ new Set();
+    pinning = /* @__PURE__ */ new Set();
+    metadataLoading = null;
+    metadataCheckedAt = Number.NEGATIVE_INFINITY;
+    heartbeatLoading = null;
+    loadingSong = null;
+    loadRetryAt = 0;
+    loadAttempts = 0;
+    syncError = "";
+    lastSyncedAt = 0;
     playedSongs = [];
     memberCount = 1;
     members = [];
@@ -265,6 +278,7 @@
       if (!roomId) throw new Error("\u521B\u5EFA\u591A\u4EBA\u623F\u95F4\u5931\u8D25\uFF1A\u670D\u52A1\u7AEF\u672A\u8FD4\u56DE\u623F\u95F4\u53F7");
       this.startRoom(String(roomId), selfUserId, selfUserId, snapshot);
       this.currentSongId = String(initialTrack.id);
+      this.currentSongBizId = snapshot?.roomPlaySongInfo?.playSong?.songBizId === void 0 ? null : String(snapshot.roomPlaySongInfo.playSong.songBizId);
       if (!this.playlist.length) this.playlist = [{ songId: initialTrack.id }];
       if (snapshot?.roomPlaySongInfo) {
         await this.applyRoomSongInfo(snapshot.roomPlaySongInfo, 0, true);
@@ -338,8 +352,12 @@
         memberCount: this.memberCount,
         members: this.members,
         paused: this.paused,
+        syncError: this.syncError,
+        lastSyncedAt: this.lastSyncedAt,
         queue: this.playlist.map((song) => ({
           songId: String(song.songId),
+          songBizId: song.songBizId === void 0 ? void 0 : String(song.songBizId),
+          pinned: song.songBizId === void 0 ? false : this.pinned.has(String(song.songBizId)),
           track: this.songCache.get(String(song.songId)),
           recommendedBy: song.songRcmdUid ? String(song.songRcmdUid) : void 0,
           pinCount: song.songBizId === void 0 ? void 0 : this.pinCounts.get(String(song.songBizId))
@@ -352,39 +370,59 @@
     }
     async detailedSnapshot() {
       if (this.inRoom) void this.refreshPinCounts();
+      void this.refreshSongDetails();
+      return this.snapshot;
+    }
+    async refreshSongDetails() {
+      if (!this.inRoom || this.metadataLoading) return;
+      if (this.timers.now() - this.metadataCheckedAt < 5e3) return;
+      const session = this.session;
       const ids = [
         ...this.playlist.map((song) => String(song.songId)),
         ...this.playedSongs
       ];
       const missing = [...new Set(ids)].filter((id) => !this.songCache.has(id)).slice(0, 50);
       if (missing.length) {
+        this.metadataCheckedAt = this.timers.now();
+        const task = (async () => {
+          try {
+            const songs = await this.api.songDetail(missing);
+            if (session !== this.session) return;
+            for (const song of songs) this.cacheTrack(toTogetherTrack(song));
+          } catch (error) {
+            this.ctx.log.warn("[\u591A\u4EBA\u4E00\u8D77\u542C] \u8BFB\u53D6\u623F\u95F4\u6B4C\u66F2\u4FE1\u606F\u5931\u8D25\uFF1A", error);
+          }
+        })();
+        this.metadataLoading = task;
         try {
-          for (const song of await this.api.songDetail(missing)) {
-            this.songCache.set(String(song.id), toTogetherTrack(song));
-          }
-          while (this.songCache.size > 100) {
-            const oldest = this.songCache.keys().next().value;
-            if (oldest === void 0) break;
-            this.songCache.delete(oldest);
-          }
-        } catch (error) {
-          this.ctx.log.warn("[\u591A\u4EBA\u4E00\u8D77\u542C] \u8BFB\u53D6\u623F\u95F4\u6B4C\u66F2\u4FE1\u606F\u5931\u8D25\uFF1A", error);
+          await task;
+        } finally {
+          if (this.metadataLoading === task) this.metadataLoading = null;
         }
       }
-      return this.snapshot;
     }
     cacheTrack(track) {
       if (track.source === "netease") this.songCache.set(String(track.id), track);
+      while (this.songCache.size > 100) {
+        const oldest = this.songCache.keys().next().value;
+        if (oldest === void 0) break;
+        this.songCache.delete(oldest);
+      }
     }
     onLocalEvent(kind, data) {
       if (!this.running || kind !== "playStateChange" || !data.state) return;
+      const resuming = this.paused && data.state === "playing";
       this.paused = data.state !== "playing";
+      if (resuming && !this.pendingPlayback) this.scheduleHeartbeat(0);
     }
     async pushSong(songId) {
       const roomId = this.requireRoom();
+      const session = this.session;
       const id = String(songId);
       if (this.findSong(id)) return;
       const data = await this.api.operateSong(roomId, id, "0", 1);
+      this.assertSession(session);
+      this.mutationRevision += 1;
       if (data.roomSongInfo) {
         this.updateRoomQueue(data.roomSongInfo, false);
       }
@@ -397,42 +435,57 @@
       this.ctx.log.info(`[\u591A\u4EBA\u4E00\u8D77\u542C] \u5DF2\u63A8\u6B4C ${id}`);
       this.scheduleHeartbeat(1500);
     }
-    async pinSong(songId) {
+    async pinSong(songId, songBizId) {
       const roomId = this.requireRoom();
+      const session = this.session;
       const id = String(songId);
-      let song = this.findSong(id);
+      let song = this.findSong(id, songBizId);
       if (!song?.songBizId) {
-        await this.runHeartbeat(false);
-        song = this.findSong(id);
+        await this.runHeartbeat();
+        this.assertSession(session);
+        song = this.findSong(id, songBizId);
       }
       if (!song) throw new Error("\u8FD9\u9996\u6B4C\u5C1A\u672A\u52A0\u5165\u591A\u4EBA\u623F\u95F4");
       if (!song.songBizId)
         throw new Error("\u623F\u95F4\u5C1A\u672A\u8FD4\u56DE\u8FD9\u9996\u6B4C\u7684\u961F\u5217\u7F16\u53F7\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5");
-      const data = await this.api.operateSong(
-        roomId,
-        id,
-        String(song.songBizId),
-        2
-      );
-      if (data.roomSongInfo) this.updateRoomQueue(data.roomSongInfo, false);
       const bizId = String(song.songBizId);
-      const optimisticCount = (this.pinCounts.get(bizId) ?? 0) + 1;
-      this.pinCounts.set(bizId, optimisticCount);
-      this.pendingPinCounts.set(bizId, {
-        count: optimisticCount,
-        until: this.timers.now() + 1e4
-      });
-      this.historyCheckedAt = Number.NEGATIVE_INFINITY;
-      void this.refreshPinCounts();
+      if (this.pinned.has(bizId) || this.pinning.has(bizId)) return;
+      this.pinning.add(bizId);
+      try {
+        const data = await this.api.operateSong(
+          roomId,
+          id,
+          String(song.songBizId),
+          2
+        );
+        this.assertSession(session);
+        if (data.roomSongInfo) this.updateRoomQueue(data.roomSongInfo, false);
+        this.mutationRevision += 1;
+        this.pinned.add(bizId);
+        const optimisticCount = (this.pinCounts.get(bizId) ?? 0) + 1;
+        this.pinCounts.set(bizId, optimisticCount);
+        this.pendingPinCounts.set(bizId, {
+          count: optimisticCount,
+          until: this.timers.now() + 1e4
+        });
+        this.historyCheckedAt = Number.NEGATIVE_INFINITY;
+        void this.refreshPinCounts();
+        this.scheduleHeartbeat(1500);
+      } finally {
+        if (session === this.session) this.pinning.delete(bizId);
+      }
     }
-    async goto(songId, loadLocally = true) {
+    async goto(songId, loadLocally = true, songBizId) {
       const roomId = this.requireRoom();
+      const session = this.session;
       const id = String(songId);
       if (!this.findSong(id)) await this.pushSong(id);
-      let song = this.findSong(id);
+      this.assertSession(session);
+      let song = this.findSong(id, songBizId);
       if (!song?.songBizId) {
-        await this.runHeartbeat(false);
-        song = this.findSong(id);
+        await this.runHeartbeat();
+        this.assertSession(session);
+        song = this.findSong(id, songBizId);
       }
       if (!song?.songBizId)
         throw new Error("\u623F\u95F4\u5C1A\u672A\u8FD4\u56DE\u8FD9\u9996\u6B4C\u7684\u961F\u5217\u7F16\u53F7\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5");
@@ -442,15 +495,20 @@
         String(song.songBizId),
         4
       );
+      this.assertSession(session);
       if (data.roomSongInfo) this.updateRoomQueue(data.roomSongInfo, false);
+      this.mutationRevision += 1;
       this.recordPlayed(id);
-      const selected = this.findSong(id) ?? song;
+      const selected = this.findSong(id, songBizId) ?? song;
       if (selected)
         this.playlist = [
           selected,
-          ...this.playlist.filter((song2) => String(song2.songId) !== id)
+          ...this.playlist.filter(
+            (entry) => String(entry.songBizId) !== String(selected.songBizId)
+          )
         ];
       this.currentSongId = id;
+      this.currentSongBizId = String(selected.songBizId);
       this.paused = false;
       this.pendingPlayback = {
         songId: id,
@@ -459,21 +517,36 @@
         at: this.timers.now()
       };
       if (loadLocally) await this.loadTrack(id);
+      this.assertSession(session);
       this.scheduleHeartbeat(1500);
     }
     async next() {
       this.requireRoom();
+      const session = this.session;
       const previousId = this.currentSongId;
-      await this.runHeartbeat(false);
+      await this.runHeartbeat();
+      this.assertSession(session);
       if (!this.inRoom || this.currentSongId !== previousId) return;
-      const next = this.playlist.find(
-        (song) => String(song.songId) !== this.currentSongId
-      );
+      const next = this.playlist[1];
       if (!next) {
         this.ctx.player.pause();
         return;
       }
-      await this.goto(String(next.songId));
+      await this.goto(
+        String(next.songId),
+        true,
+        next.songBizId === void 0 ? void 0 : String(next.songBizId)
+      );
+    }
+    /** 本机暂停后先追上官方进度，再恢复声音。 */
+    async resumePlayback() {
+      this.requireRoom();
+      const session = this.session;
+      this.paused = false;
+      await this.runHeartbeat();
+      this.assertSession(session);
+      if (this.syncError) throw new Error(this.syncError);
+      if (!this.pendingPlayback) this.ctx.player.play();
     }
     /** 自然播完只等待服务端推进时间线，不替所有人发“切歌”操作。 */
     onTrackEnded() {
@@ -482,11 +555,25 @@
       this.endedFastPolls = 5;
       this.scheduleHeartbeat(0);
     }
+    /** 本机音源不可用时重试当前房间歌曲，不触发全房间切歌。 */
+    onPlaybackFailed() {
+      if (!this.inRoom || !this.currentSongId) return;
+      this.pendingPlayback ??= {
+        songId: this.currentSongId,
+        position: 0,
+        playing: true,
+        at: this.timers.now()
+      };
+      this.syncError = "\u5F53\u524D\u6B4C\u66F2\u6682\u65F6\u65E0\u6CD5\u64AD\u653E\uFF0C\u6B63\u5728\u91CD\u8BD5\uFF1B\u623F\u95F4\u961F\u5217\u7EE7\u7EED\u4FDD\u7559";
+      this.scheduleHeartbeat(2e3);
+    }
     async onLocalTrackChange(songId) {
       const id = String(songId);
       if (!this.running || !this.roomId || this.currentSongId === id) return;
+      const session = this.session;
       try {
         await this.pushSong(id);
+        this.assertSession(session);
         await this.goto(id, false);
       } catch (error) {
         this.ctx.log.warn(
@@ -500,12 +587,15 @@
         return null;
       const pending = this.pendingPlayback;
       this.pendingPlayback = null;
+      this.loadAttempts = 0;
+      this.syncError = "";
       return {
         position: pending.position + Math.max(0, this.timers.now() - pending.at),
         playing: pending.playing
       };
     }
     startRoom(roomId, inviterId, selfUserId, snapshot) {
+      this.resetRoom();
       this.roomId = roomId;
       this.inviterId = inviterId;
       this.selfUserId = selfUserId;
@@ -568,14 +658,28 @@
         delay
       );
     }
-    async runHeartbeat(reschedule = true) {
+    async runHeartbeat() {
+      if (this.heartbeatLoading) return this.heartbeatLoading;
+      const task = this.performHeartbeat(true);
+      this.heartbeatLoading = task;
+      try {
+        await task;
+      } finally {
+        if (this.heartbeatLoading === task) this.heartbeatLoading = null;
+      }
+    }
+    async performHeartbeat(reschedule) {
       if (!this.running || !this.roomId) return;
       const roomId = this.roomId;
+      const session = this.session;
+      const revision = this.mutationRevision;
       const startedAt = this.timers.now();
       try {
         const data = await this.api.heartbeat(roomId);
-        if (!this.running || this.roomId !== roomId) return;
+        if (!this.running || session !== this.session) return;
         const endedAt = this.timers.now();
+        this.lastSyncedAt = endedAt;
+        if (!this.pendingPlayback) this.syncError = "";
         if (data.roomInfoDTO?.roomClosed) {
           this.resetRoom();
           this.ctx.log.warn("[\u591A\u4EBA\u4E00\u8D77\u542C] \u623F\u95F4\u5DF2\u7ED3\u675F");
@@ -583,15 +687,19 @@
         }
         this.heartbeatMs = nextHeartbeatDelay(data.heartBeatDuration);
         this.backoff = 1;
-        if (data.roomPlaySongInfo) {
+        if (data.roomPlaySongInfo && revision === this.mutationRevision) {
           await this.applyRoomSongInfo(
             data.roomPlaySongInfo,
             Math.max(0, (endedAt - startedAt) / 2),
             false
           );
         }
-        await Promise.all([this.refreshMembers(roomId), this.refreshPinCounts()]);
+        if (session !== this.session) return;
+        void this.refreshMembers(roomId);
+        void this.refreshPinCounts();
       } catch (error) {
+        if (session !== this.session) return;
+        this.syncError = "\u623F\u95F4\u8FDE\u63A5\u6682\u65F6\u4E2D\u65AD\uFF0C\u6B63\u5728\u91CD\u8BD5";
         if (error instanceof NeteaseApiError && error.code === "488") {
           this.resetRoom();
           this.ctx.log.warn("[\u591A\u4EBA\u4E00\u8D77\u542C] \u623F\u95F4\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u521B\u5EFA\u6216\u52A0\u5165");
@@ -603,8 +711,8 @@
           error instanceof Error ? error.message : error
         );
       } finally {
-        if (reschedule && this.running) {
-          if (this.endedSongId === this.currentSongId && this.endedFastPolls > 0) {
+        if (reschedule && this.running && session === this.session) {
+          if (this.pendingPlayback || this.endedSongId === this.currentSongId && this.endedFastPolls > 0) {
             this.endedFastPolls -= 1;
             this.scheduleHeartbeat(2e3);
           } else {
@@ -616,9 +724,10 @@
       }
     }
     async refreshMembers(roomId) {
+      const session = this.session;
       try {
         const status = await this.api.roomStatus();
-        if (!this.running || this.roomId !== roomId) return;
+        if (!this.running || session !== this.session) return;
         const snapshot = status.multiLtRoomSnapshot;
         const statusRoomId = snapshot?.roomId ?? snapshot?.multiRoomInfoDTO?.roomId;
         if (!snapshot?.multiLtRoomUserAgg || statusRoomId && statusRoomId !== roomId)
@@ -638,16 +747,19 @@
       }
     }
     async applyRoomSongInfo(info, halfRttMs, force) {
+      const session = this.session;
       if (!this.updateRoomQueue(info, force)) return;
       const playSong = info.playSong;
       if (playSong?.songId === void 0) return;
       const targetId = String(playSong.songId);
+      const targetBizId = playSong.songBizId === void 0 ? null : String(playSong.songBizId);
       const expected = expectedMultiPosition(info.playedTime, halfRttMs);
-      if (targetId !== this.currentSongId) {
+      if (targetId !== this.currentSongId || targetBizId !== null && targetBizId !== this.currentSongBizId) {
         this.endedSongId = null;
         this.endedFastPolls = 0;
         this.recordPlayed(targetId);
         this.currentSongId = targetId;
+        this.currentSongBizId = targetBizId;
         this.paused = false;
         this.pendingPlayback = {
           songId: targetId,
@@ -661,10 +773,14 @@
       if (this.pendingPlayback?.songId === targetId) {
         this.pendingPlayback.position = expected;
         this.pendingPlayback.at = this.timers.now();
+        if (!this.loadingSong && this.timers.now() >= this.loadRetryAt) {
+          await this.loadTrack(targetId);
+        }
         return;
       }
       if (this.paused && !force) return;
       const localPosition = await this.ctx.player.getPosition();
+      if (session !== this.session || targetId !== this.currentSongId) return;
       if (force || info.forceSync || needsSeek(localPosition, expected)) {
         this.ctx.player.seek(Math.round(expected));
       }
@@ -682,16 +798,34 @@
       return true;
     }
     async loadTrack(songId) {
+      if (this.loadingSong === songId) return;
+      const session = this.session;
+      this.loadingSong = songId;
       try {
-        const [song] = await this.api.songDetail([songId]);
-        if (!song) throw new Error("\u7F51\u6613\u4E91\u672A\u8FD4\u56DE\u6B4C\u66F2\u4FE1\u606F");
-        if (!this.running || this.currentSongId !== songId) return;
-        this.ctx.player.playTrack(toTogetherTrack(song));
+        let track = this.songCache.get(songId);
+        if (!track) {
+          const [song] = await this.api.songDetail([songId]);
+          if (!song) throw new Error("\u7F51\u6613\u4E91\u672A\u8FD4\u56DE\u6B4C\u66F2\u4FE1\u606F");
+          track = toTogetherTrack(song);
+        }
+        if (!this.running || session !== this.session || this.currentSongId !== songId)
+          return;
+        this.cacheTrack(track);
+        this.loadAttempts += 1;
+        this.loadRetryAt = this.timers.now() + Math.min(3e4, 5e3 * this.loadAttempts);
+        this.ctx.player.playTrack(track);
       } catch (error) {
+        if (session !== this.session || this.currentSongId !== songId) return;
+        this.loadAttempts += 1;
+        this.loadRetryAt = this.timers.now() + Math.min(3e4, 2e3 * this.loadAttempts);
+        this.syncError = "\u5F53\u524D\u6B4C\u66F2\u52A0\u8F7D\u5931\u8D25\uFF0C\u6B63\u5728\u91CD\u65B0\u8FDE\u63A5\u623F\u95F4\u64AD\u653E";
         this.ctx.log.error(
           "[\u591A\u4EBA\u4E00\u8D77\u542C] \u52A0\u8F7D\u6B4C\u66F2\u5931\u8D25\uFF1A",
           error instanceof Error ? error.message : error
         );
+      } finally {
+        if (session === this.session && this.loadingSong === songId)
+          this.loadingSong = null;
       }
     }
     /** 推荐消息以 songBizId 对应待播实例；同一首歌重复推荐也不会混淆次数。 */
@@ -700,11 +834,12 @@
       if (this.historyLoading) return this.historyLoading;
       if (this.timers.now() - this.historyCheckedAt < 1e4) return;
       const roomId = this.roomId;
+      const session = this.session;
       this.historyCheckedAt = this.timers.now();
       this.historyLoading = (async () => {
         try {
           const history = await this.api.roomHistory(roomId);
-          if (!this.running || this.roomId !== roomId) return;
+          if (!this.running || session !== this.session) return;
           const records = [...history.records ?? []].sort(
             (a, b) => Number(a.sendTime ?? 0) - Number(b.sendTime ?? 0)
           );
@@ -716,10 +851,22 @@
             if (Number.isSafeInteger(count) && count >= 0) {
               const bizId = String(resource.bizId);
               const pending = this.pendingPinCounts.get(bizId);
-              if (pending && count < pending.count && this.timers.now() < pending.until)
+              if (pending && (count < pending.count || resource.uped === false) && this.timers.now() < pending.until)
                 continue;
               this.pendingPinCounts.delete(bizId);
               this.pinCounts.set(bizId, count);
+              if (resource.uped === true) this.pinned.add(bizId);
+              else if (resource.uped === false) this.pinned.delete(bizId);
+            }
+          }
+          const activeIds = new Set(
+            this.playlist.map((song) => String(song.songBizId))
+          );
+          for (const id of this.pinCounts.keys()) {
+            if (!activeIds.has(id)) {
+              this.pinCounts.delete(id);
+              this.pinned.delete(id);
+              this.pendingPinCounts.delete(id);
             }
           }
         } catch (error) {
@@ -728,13 +875,19 @@
             error instanceof Error ? error.message : error
           );
         } finally {
-          this.historyLoading = null;
+          if (session === this.session) this.historyLoading = null;
         }
       })();
       return this.historyLoading;
     }
-    findSong(songId) {
-      return this.playlist.find((song) => String(song.songId) === String(songId));
+    findSong(songId, songBizId) {
+      return this.playlist.find(
+        (song) => String(song.songId) === String(songId) && (songBizId === void 0 || String(song.songBizId) === songBizId)
+      );
+    }
+    assertSession(session) {
+      if (!this.inRoom || session !== this.session)
+        throw new Error("\u623F\u95F4\u5DF2\u5207\u6362\uFF0C\u6B64\u6B21\u64CD\u4F5C\u5DF2\u7ED3\u675F");
     }
     recordPlayed(nextSongId) {
       if (this.currentSongId && this.currentSongId !== nextSongId) {
@@ -758,6 +911,18 @@
       }
     }
     resetRoom() {
+      this.session += 1;
+      this.historyLoading = null;
+      this.metadataLoading = null;
+      this.metadataCheckedAt = Number.NEGATIVE_INFINITY;
+      this.heartbeatLoading = null;
+      this.loadingSong = null;
+      this.loadRetryAt = 0;
+      this.loadAttempts = 0;
+      this.syncError = "";
+      this.lastSyncedAt = 0;
+      this.pinned.clear();
+      this.pinning.clear();
       this.running = false;
       if (this.heartbeatHandle) this.timers.clearTimeout(this.heartbeatHandle);
       this.heartbeatHandle = null;
@@ -765,6 +930,7 @@
       this.inviterId = null;
       this.selfUserId = "";
       this.currentSongId = null;
+      this.currentSongBizId = null;
       this.playlist = [];
       this.songCache.clear();
       this.pinCounts.clear();
@@ -891,8 +1057,14 @@
     const parsed = parseRoomLink(String(value ?? ""));
     if (parsed.roomId) ctx.log.info(`[\u4E00\u8D77\u542C] \u623F\u95F4\u94FE\u63A5\u5DF2\u66F4\u65B0\uFF1A${parsed.roomId}`);
   });
-  ctx.on("menuClick", async ({ menuId, track, data }) => {
+  var handleMenu = async ({ menuId, track, data }) => {
     switch (menuId) {
+      case "together-play":
+        await engine.resumePlayback();
+        return { data: engine.snapshot };
+      case "together-retry":
+        engine.onPlaybackFailed();
+        return { data: engine.snapshot };
       case "together-status":
         return { data: await engine.detailedSnapshot() };
       case MENU.create: {
@@ -960,7 +1132,8 @@
         if (!engine.inRoom) return { error: "\u8BF7\u5148\u52A0\u5165\u4E00\u8D77\u542C" };
         if (!isNeteaseTrack(track)) return { error: "\u4EC5\u652F\u6301\u7F6E\u9876\u7F51\u6613\u4E91\u5728\u7EBF\u6B4C\u66F2" };
         try {
-          await engine.pinSong(String(track.id));
+          const songBizId = typeof data === "object" && data !== null && "songBizId" in data ? String(data.songBizId) : void 0;
+          await engine.pinSong(String(track.id), songBizId);
           return { toast: `\u5DF2\u7F6E\u9876\uFF1A${track.title}`, data: engine.snapshot };
         } catch (err) {
           return { error: err instanceof Error ? err.message : String(err) };
@@ -970,7 +1143,8 @@
         if (!engine.inRoom) return { error: "\u8BF7\u5148\u52A0\u5165\u4E00\u8D77\u542C" };
         if (!isNeteaseTrack(track)) return { error: "\u4EC5\u652F\u6301\u64AD\u653E\u7F51\u6613\u4E91\u5728\u7EBF\u6B4C\u66F2" };
         try {
-          await engine.goto(String(track.id));
+          const songBizId = typeof data === "object" && data !== null && "songBizId" in data ? String(data.songBizId) : void 0;
+          await engine.goto(String(track.id), true, songBizId);
           return { toast: `\u5DF2\u5207\u6B4C\uFF1A${track.title}`, data: engine.snapshot };
         } catch (err) {
           return { error: err instanceof Error ? err.message : String(err) };
@@ -992,6 +1166,34 @@
       default:
         return;
     }
+  };
+  var actionQueue = Promise.resolve();
+  var actionSession = 0;
+  ctx.on("menuClick", async (request) => {
+    if ([MENU.create, MENU.resume, MENU.join, MENU.leave].includes(
+      request.menuId
+    )) {
+      actionSession += 1;
+      return handleMenu(request);
+    }
+    if (![MENU.push, MENU.pin, MENU.goto, MENU.next, "together-play"].includes(
+      request.menuId
+    )) {
+      return handleMenu(request);
+    }
+    const session = actionSession;
+    const result = actionQueue.then(() => {
+      if (session !== actionSession)
+        throw new Error("\u623F\u95F4\u5DF2\u5207\u6362\uFF0C\u6B64\u6B21\u64CD\u4F5C\u5DF2\u7ED3\u675F");
+      return handleMenu(request);
+    });
+    actionQueue = result.then(
+      () => {
+      },
+      () => {
+      }
+    );
+    return result;
   });
   if (ctx.getSetting(SETTING_AUTO_JOIN)) {
     void joinFromSetting().catch((err) => {

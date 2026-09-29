@@ -12,7 +12,12 @@
  */
 
 import { buildMultiShareLink, parseRoomLink, TogetherSyncEngine } from "./sync";
-import type { PlaybackEventData, SplayerContext, TogetherTrack } from "./types";
+import type {
+  MenuClickReq,
+  PlaybackEventData,
+  SplayerContext,
+  TogetherTrack,
+} from "./types";
 
 /* ================= 宿主沙箱全局 ================= */
 
@@ -187,8 +192,14 @@ ctx.onSettingChange(SETTING_ROOM_LINK, (value) => {
 
 /* ---------- 菜单点击 ---------- */
 
-ctx.on("menuClick", async ({ menuId, track, data }) => {
+const handleMenu = async ({ menuId, track, data }: MenuClickReq) => {
   switch (menuId) {
+    case "together-play":
+      await engine.resumePlayback();
+      return { data: engine.snapshot };
+    case "together-retry":
+      engine.onPlaybackFailed();
+      return { data: engine.snapshot };
     case "together-status":
       return { data: await engine.detailedSnapshot() };
     case MENU.create: {
@@ -262,7 +273,11 @@ ctx.on("menuClick", async ({ menuId, track, data }) => {
       if (!engine.inRoom) return { error: "请先加入一起听" };
       if (!isNeteaseTrack(track)) return { error: "仅支持置顶网易云在线歌曲" };
       try {
-        await engine.pinSong(String(track.id));
+        const songBizId =
+          typeof data === "object" && data !== null && "songBizId" in data
+            ? String(data.songBizId)
+            : undefined;
+        await engine.pinSong(String(track.id), songBizId);
         return { toast: `已置顶：${track.title}`, data: engine.snapshot };
       } catch (err) {
         return { error: err instanceof Error ? err.message : String(err) };
@@ -272,7 +287,11 @@ ctx.on("menuClick", async ({ menuId, track, data }) => {
       if (!engine.inRoom) return { error: "请先加入一起听" };
       if (!isNeteaseTrack(track)) return { error: "仅支持播放网易云在线歌曲" };
       try {
-        await engine.goto(String(track.id));
+        const songBizId =
+          typeof data === "object" && data !== null && "songBizId" in data
+            ? String(data.songBizId)
+            : undefined;
+        await engine.goto(String(track.id), true, songBizId);
         return { toast: `已切歌：${track.title}`, data: engine.snapshot };
       } catch (err) {
         return { error: err instanceof Error ? err.message : String(err) };
@@ -294,6 +313,37 @@ ctx.on("menuClick", async ({ menuId, track, data }) => {
     default:
       return;
   }
+};
+
+let actionQueue = Promise.resolve();
+let actionSession = 0;
+ctx.on("menuClick", async (request) => {
+  if (
+    [MENU.create, MENU.resume, MENU.join, MENU.leave].includes(
+      request.menuId as typeof MENU.create,
+    )
+  ) {
+    actionSession += 1;
+    return handleMenu(request);
+  }
+  if (
+    ![MENU.push, MENU.pin, MENU.goto, MENU.next, "together-play"].includes(
+      request.menuId,
+    )
+  ) {
+    return handleMenu(request);
+  }
+  const session = actionSession;
+  const result = actionQueue.then(() => {
+    if (session !== actionSession)
+      throw new Error("房间已切换，此次操作已结束");
+    return handleMenu(request);
+  });
+  actionQueue = result.then(
+    () => {},
+    () => {},
+  );
+  return result;
 });
 
 /* ---------- 自动加入 ---------- */
