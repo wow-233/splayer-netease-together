@@ -1,6 +1,6 @@
 {
   "name": "splayer-netease-together",
-  "version": "1.3.5",
+  "version": "1.3.6",
   "description": "SPlayer-Next 网易云官方多人一起听插件（建房、加入、同步、推歌与置顶）",
   "type": "module",
   "private": true,

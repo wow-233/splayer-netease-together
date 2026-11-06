@@ -4,11 +4,11 @@ SPlayer-Next 的「网易云多人一起听」控制插件：让 Windows 桌面�
 
 房间使用网易云官方 `multi` 协议和 `multishare` 邀请链接，可以容纳多人。旧的“耳机分你一半”双人链接会被明确拒绝。
 
-## Windows 直接安装
+## Windows 安装
 
-1. 打开 [v1.3.3 下载页](https://github.com/wow-233/splayer-netease-together/releases/tag/v1.3.3)，下载 Windows x64 安装包和 `netease-listen-together.js` 插件文件。
-2. 运行安装包，打开 SPlayer-Next 并登录网易云音乐。
-3. 在「设置 → 插件管理 → 本地导入」选择下载的插件文件，允许「网易云 / 控制 / 联网 / 界面」权限。
+1. 安装定制版客户端：到 [wow-233/SPlayer-Next 的 nightly 发布](https://github.com/wow-233/SPlayer-Next/releases/tag/nightly) 下载 `x64-setup.exe` 安装（自带一起听宿主扩展），并在「设置 → 更新通道」选择 **nightly**，此后客户端内即可一键更新。
+2. 下载本插件：打开 SPlayer-Next 的「多人一起听」页面，未安装插件时会看到引导卡片，点击**下载插件**直达本仓库 [releases](https://github.com/wow-233/splayer-netease-together/releases)；也可以手动下载 `netease-listen-together.js`。
+3. 在「设置 → 插件管理 → 本地导入」选择插件文件，允许「网易云 / 控制 / 联网 / 界面」权限；已安装的插件之后会在插件管理里提示新版本。
 4. 播放网易云在线歌曲，从侧边栏或播放器进入「多人一起听」，创建房间或粘贴手机端多人邀请链接。
 
 安装包由 GitHub Actions 从公开源码构建，不包含发布者的 `UserData` 或登录信息。此版本为体验版，双设备互通仍需实际验证。
@@ -17,13 +17,17 @@ SPlayer-Next 的「网易云多人一起听」控制插件：让 Windows 桌面�
 
 | 部分                    | 位置                                                                                                 | 说明                                                              |
 | ----------------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| 宿主扩展（Host Bridge） | [SPlayer-Next 一起听分支](https://github.com/wow-233/SPlayer-Next/tree/feat/netease-listen-together) | 给插件系统加 `player.playTrack`、`netease.call` 与 `netease` 权限 |
+| 宿主扩展（Host Bridge） | [SPlayer-Next 一起听分支](https://github.com/wow-233/SPlayer-Next/tree/feat/netease-listen-together-local) | 给插件系统加 `player.playTrack`、`netease.call` 与 `netease` 权限 |
 | 插件（本目录）          | `splayer-netease-together/`                                                                          | 一起听协议 + 同步引擎 + 交互                                      |
 
 ## 宿主扩展清单（已应用）
 
+当前本地适配宿主保留了新版官方的 **Host API 5**；本插件声明的 `@apiLevel 4` 是最低要求，可以继续使用，不需要降低宿主 API 级别。下方 API 4 是最初引入一起听扩展时的版本。
+
+适配位于 [wow-233/SPlayer-Next 的 `feat/netease-listen-together-local` 分支](https://github.com/wow-233/SPlayer-Next/tree/feat/netease-listen-together-local)（已推送），客户端每日通过 GitHub Actions 自动与上游 `SPlayer-Dev/SPlayer-Next` 同步并发布 `nightly` 安装包，插件与宿主随之一键更新。**官方原版仍不能只导入本插件就获得多人一起听功能**，直接安装官方更新会失去此宿主扩展。
+
 - `shared/types/plugin.ts`：`PLUGIN_GRANTS` 增加 `netease`；`HostCallMethod` 增加 `player.playTrack`、`netease.call`；`PluginPlayerApi.playTrack`；`HostApi.netease.call`。
-- `shared/defaults/plugin-api.ts`：`HOST_API_LEVEL` 提升到 `4`。
+- `shared/defaults/plugin-api.ts`：宿主保持上游 **Host API 5**，插件 `@apiLevel 4` 向下兼容。
 - `electron/main/plugins/host.ts`：`netease.call` 权限门控 + 分发到 `callNetease`；`player.playTrack` 分发到 `playerControl.playTrack`。
 - `electron/main/plugins/host.worker.ts`：沙箱暴露 `splayer.netease.call` 与 `splayer.player.playTrack`。
 - `electron/main/apis/netease/modules/listentogether_*.ts`：多人建房、加入、心跳、成员状态、推荐记录、歌曲操作、退出及校验 token 接口，并在 `modules/index.ts` 注册、在 `index.ts` 标记为非缓存。
@@ -41,7 +45,7 @@ npm run smoke      # 用 node:vm 模拟沙箱加载真实产物
 
 ## 从源码安装
 
-1. 先构建并运行已集成宿主扩展的 [SPlayer-Next 一起听分支](https://github.com/wow-233/SPlayer-Next/tree/feat/netease-listen-together)。
+1. 先构建并运行已集成宿主扩展的 [SPlayer-Next 一起听分支](https://github.com/wow-233/SPlayer-Next/tree/feat/netease-listen-together-local)。
 2. 在 **设置 → 插件管理 → 本地导入** 选择 `dist/netease-listen-together.js`。
 3. 在插件卡片上确认已授予 `网易云 / 控制 / 联网 / 界面` 权限。
 
